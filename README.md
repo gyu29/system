@@ -1,8 +1,3 @@
-# ltforecast
-
-12-month cross-sectional US stock return forecasting. Build plan: `long-horizon-prediction-plan.md`.
-Status: **Phase 1 (data layer)** — point-in-time tables, monthly universe, data-quality checks.
-
 ## Run
 
 ```bash

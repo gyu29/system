@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ltforecast"
+version = "0.1.0"
+description = "Long-horizon (12m) cross-sectional stock return forecasting"
+requires-python = ">=3.12"
+dependencies = [
+    "polars>=1.20",
+    "duckdb>=1.1",
+    "pyarrow>=17",
+    "pyyaml>=6",
+    "requests>=2.32",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+ltforecast = "ltforecast.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ltforecast"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

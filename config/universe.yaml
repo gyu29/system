@@ -1,0 +1,55 @@
+# Universe, date boundaries and point-in-time rules (plan sections 0 and 1).
+# Fixed before any modelling. Changing anything here after Phase 5 counts as a trial.
+
+data_dir: data
+
+dates:
+  history_start: 2000-01-01
+  # Development: prediction dates Jan 2000 -> Oct 2021 (labels end Oct 2022)
+  dev_end: 2021-10-31
+  # Locked holdout: prediction dates Nov 2022 -> Oct 2025. Evaluated once, in Phase 9.
+  holdout_start: 2022-11-01
+  holdout_end: 2025-10-31
+
+universe:
+  # Sharadar TICKERS.category values that count as US common stock
+  categories:
+    - Domestic Common Stock
+    - Domestic Common Stock Primary Class
+  min_price: 5.0               # unadjusted close on the formation date
+  min_market_cap: 300.0e6      # in dollars of `cpi_base_date`
+  cpi_series: CPIAUCSL
+  cpi_base_date: 2025-12-31    # threshold is deflated back in time from this date
+  min_adv: 1.0e6               # average daily dollar volume, trailing window
+  adv_window_days: 63
+
+pit:
+  # A fundamental is usable only from available_date + this many trading days
+  fundamental_lag_trading_days: 1
+  sf1_dimensions: [ARQ, ART, ARY]   # "as reported" dimensions only, never restated (MR*)
+
+delisting:
+  # Assumed delisting return when the vendor gives none (Shumway 1997).
+  performance_return: -0.30
+  merger_return: 0.0
+  # Sharadar ACTIONS codes, classified. Anything unlisted is treated as `unknown_as`.
+  performance_actions: [bankruptcyliquidation, regulatorydelisting, voluntarydelisting]
+  merger_actions: [acquisitionby, mergerfrom]
+  unknown_as: performance    # conservative: an unexplained delisting is assumed bad
+
+macro:
+  # FRED series. `vintage: true` -> first-release values from ALFRED (output_type=4), available
+  # from their real release date. ALFRED vintages don't reach back to 2000 for every series, so
+  # observations without a vintage fall back to observation date + release_lag_days (flagged).
+  # Market series are never revised: available the next day.
+  series:
+    - {id: CPIAUCSL, vintage: true,  release_lag_days: 50}   # CPI dated 1st of month, released ~mid next month
+    - {id: DGS10,    vintage: false, release_lag_days: 1}    # 10y Treasury
+    - {id: DGS3MO,   vintage: false, release_lag_days: 1}    # 3m Treasury (term spread = DGS10 - DGS3MO)
+    - {id: BAA10Y,   vintage: false, release_lag_days: 1}    # Baa - 10y credit spread
+    - {id: FEDFUNDS, vintage: false, release_lag_days: 35}   # monthly avg dated 1st of month: known ~1 month later
+
+
+quality:
+  max_daily_move_without_action: 0.5
+  max_monthly_count_change: 0.10

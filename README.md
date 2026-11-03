@@ -8,10 +8,28 @@ export FRED_API_KEY=...               # free, https://fred.stlouisfed.org/docs/a
 .venv/bin/ltforecast ingest fred
 .venv/bin/ltforecast build            # data/core/<table>/year=YYYY/*.parquet
 .venv/bin/ltforecast check            # exits 1 on any FAIL; writes data/reports/{coverage,spot_check}.csv
+.venv/bin/ltforecast labels           # data/core/{labels,benchmark_daily,barrier_labels}
 .venv/bin/pytest
 ```
 
-Config (universe filters, holdout dates, PIT and delisting rules): `config/universe.yaml`.
+Config (universe filters, holdout dates, PIT, delisting and label rules): `config/universe.yaml`.
+
+## Labels (`labels.py`, `levels.py`)
+
+One row per in-universe (stock, month end); horizons 3m/6m/12m = 63/126/252 trading days.
+
+- `fwd_ret_h`: total return from `closeadj`. A delisting inside the window earns the assumed delisting
+  return on the next trading day; the proceeds then sit in the benchmark until the window ends.
+- `bench_ret_h`: a daily cap-weighted index of the universe. Members are the stocks in the universe at
+  the previous month end, weighted by their previous-day market cap (`benchmark_daily`).
+- `excess_h = log(1+fwd) − log(1+bench)`. `excess_w_h` is winsorized 1/99% per date.
+  `rank_h` is the per-date percentile; `target = rank_12m` is the training label.
+- `label_end_h` is the last day of each window, which Phase 4 uses to purge overlapping training rows.
+  `period` marks each row dev / gap / holdout / live.
+- Null labels: a window that runs past the data, or a stock whose prices stop without a delisting.
+- `barrier_labels`: 25 TP/SL pairs per entry. Closes are checked daily. A gap through a level fills at
+  the open; otherwise the fill is at the level. **σ is trailing 12m realized vol for now**, and becomes
+  the forecast vol in Phase 6, when these labels get rebuilt.
 
 ## Point-in-time rules enforced in code
 

@@ -64,6 +64,28 @@ class QualityRules:
 
 
 @dataclass(frozen=True)
+class BarrierRules:
+    horizon: str
+    # None = no barrier on that side
+    k_tp: tuple[float | None, ...]
+    k_sl: tuple[float | None, ...]
+    tp_bounds: tuple[float, float]
+    sl_bounds: tuple[float, float]
+    sigma_window: int
+    sigma_min_obs: int
+
+
+@dataclass(frozen=True)
+class LabelRules:
+    horizons: dict[str, int]  # name -> trading days
+    primary: str
+    winsorize: tuple[float, float]
+    vol_min_obs: int
+    stale_price_days: int
+    barriers: BarrierRules
+
+
+@dataclass(frozen=True)
 class Config:
     data_dir: Path
     dates: Dates
@@ -72,6 +94,7 @@ class Config:
     delisting: DelistingRules
     macro: tuple[MacroSeries, ...]
     quality: QualityRules
+    labels: LabelRules
     raw: dict = field(repr=False, default_factory=dict)
 
 
@@ -91,6 +114,12 @@ def load_config(path: Path | str = DEFAULT_CONFIG) -> Config:
     dates = Dates(**{k: _as_date(v) for k, v in d.items()})
     if not dates.dev_end < dates.holdout_start <= dates.holdout_end:
         raise ValueError("holdout must start after dev_end")
+
+    lab, bar = raw["labels"], raw["labels"]["barriers"]
+    horizons = {str(k): int(v) for k, v in lab["horizons"].items()}
+    for name in (lab["primary"], bar["horizon"]):
+        if name not in horizons:
+            raise ValueError(f"labels horizon {name!r} not in {sorted(horizons)}")
 
     return Config(
         data_dir=data_dir,
@@ -123,6 +152,22 @@ def load_config(path: Path | str = DEFAULT_CONFIG) -> Config:
         quality=QualityRules(
             max_daily_move_without_action=float(q["max_daily_move_without_action"]),
             max_monthly_count_change=float(q["max_monthly_count_change"]),
+        ),
+        labels=LabelRules(
+            horizons=horizons,
+            primary=lab["primary"],
+            winsorize=(float(lab["winsorize"][0]), float(lab["winsorize"][1])),
+            vol_min_obs=int(lab["vol_min_obs"]),
+            stale_price_days=int(lab["stale_price_days"]),
+            barriers=BarrierRules(
+                horizon=bar["horizon"],
+                k_tp=tuple(None if k is None else float(k) for k in bar["k_tp"]),
+                k_sl=tuple(None if k is None else float(k) for k in bar["k_sl"]),
+                tp_bounds=(float(bar["tp_bounds"][0]), float(bar["tp_bounds"][1])),
+                sl_bounds=(float(bar["sl_bounds"][0]), float(bar["sl_bounds"][1])),
+                sigma_window=int(bar["sigma_window"]),
+                sigma_min_obs=int(bar["sigma_min_obs"]),
+            ),
         ),
         raw=raw,
     )

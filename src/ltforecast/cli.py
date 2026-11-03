@@ -87,6 +87,52 @@ def build(config: Path = ConfigOpt) -> None:
 
 
 @app.command()
+def labels(config: Path = ConfigOpt) -> None:
+    """Build forward-return and triple-barrier labels from the core tables (plan section 2)."""
+    from ltforecast.labels import build_labels, delisting_returns
+    from ltforecast.levels import barrier_labels, trailing_sigma
+
+    cfg = load_config(config)
+    store = Store(cfg.data_dir)
+    rules = cfg.labels
+    prices = store.scan("prices_daily").collect()
+    securities = store.scan("securities").collect()
+
+    lab, bench = build_labels(
+        prices,
+        store.scan("universe").collect(),
+        store.scan("marketcap_daily").collect(),
+        securities,
+        rules,
+        cfg.delisting,
+        cfg.dates,
+    )
+    store.write("benchmark_daily", bench)
+    store.write("labels", lab)
+    for name in rules.horizons:
+        n = lab[f"fwd_ret_{name}"].is_not_null().sum()
+        typer.echo(f"labels {name}: {n:,} of {lab.height:,} rows")
+
+    b = rules.barriers
+    calendar = bench["date"]
+    entries = (
+        lab.filter(pl.col(f"fwd_ret_{b.horizon}").is_not_null())
+        .select("security_id", "date")
+        .join(trailing_sigma(prices, b.sigma_window, b.sigma_min_obs), on=["security_id", "date"], how="left")
+    )
+    bar = barrier_labels(
+        prices,
+        entries,
+        delisting_returns(securities, cfg.delisting, calendar),
+        calendar,
+        rules.horizons[b.horizon],
+        b,
+    )
+    store.write("barrier_labels", bar)
+    typer.echo(f"barrier_labels: {bar.height:,} rows ({len(b.k_tp) * len(b.k_sl)} TP/SL pairs)")
+
+
+@app.command()
 def check(config: Path = ConfigOpt) -> None:
     """Run data-quality tests. Exits non-zero if any check fails."""
     from ltforecast.quality import run_all

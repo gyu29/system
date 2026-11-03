@@ -8,7 +8,17 @@ from pathlib import Path
 import duckdb
 import polars as pl
 
-CORE_TABLES = ("securities", "prices_daily", "fundamentals_pit", "macro_pit", "marketcap_daily", "universe")
+CORE_TABLES = (
+    "securities",
+    "prices_daily",
+    "fundamentals_pit",
+    "macro_pit",
+    "marketcap_daily",
+    "universe",
+    "benchmark_daily",
+    "labels",
+    "barrier_labels",
+)
 
 # Tables partitioned by year, and the date column that decides the partition.
 PARTITION_COL = {
@@ -16,6 +26,9 @@ PARTITION_COL = {
     "fundamentals_pit": "available_date",
     "marketcap_daily": "date",
     "universe": "date",
+    "benchmark_daily": "date",
+    "labels": "date",
+    "barrier_labels": "date",
 }
 
 

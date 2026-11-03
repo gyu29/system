@@ -1,6 +1,7 @@
 import datetime as dt
 
 import polars as pl
+import pytest
 from typer.testing import CliRunner
 
 from ltforecast import quality
@@ -59,3 +60,20 @@ def test_end_to_end_build_and_check(cfg, raw_tickers, raw_sep, raw_sf1, raw_dail
     assert "[PASS] delisted_present" in checked.output
     assert (cfg.data_dir / "reports" / "coverage.csv").exists()
     assert (cfg.data_dir / "reports" / "spot_check.csv").exists()
+
+    labelled = runner.invoke(app, ["labels", "--config", str(config)])
+    assert labelled.exit_code == 0, labelled.output
+    lab = store.scan("labels").collect()
+    bench = dict(store.scan("benchmark_daily").select("date", "bench_level").collect().iter_rows())
+
+    # CCC (bankrupt 2020-06-30, flat at $20): the 12m window from 2019-07-31 contains the delisting.
+    # It earns -30% on the next trading day, then holds the benchmark to the window end.
+    ccc = lab.filter((pl.col("security_id") == 103) & (pl.col("date") == d(2019, 7, 31))).row(0, named=True)
+    end = ccc["label_end_12m"]
+    assert ccc["fwd_ret_12m"] == pytest.approx(0.7 * bench[end] / bench[d(2020, 7, 1)] - 1)
+    assert lab.filter(pl.col("label_end_12m") > d(2020, 12, 31)).height == 0
+
+    bar = store.scan("barrier_labels").collect()
+    n_entries = bar.select("security_id", "date").n_unique()
+    assert n_entries > 0 and bar.height == 25 * n_entries
+    assert set(bar["outcome"]) <= {"tp", "sl", "time"}

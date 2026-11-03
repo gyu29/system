@@ -50,6 +50,25 @@ macro:
     - {id: FEDFUNDS, vintage: false, release_lag_days: 35}   # monthly avg dated 1st of month: known ~1 month later
 
 
+labels:
+  # Forward windows in trading days from the month-end close (plan section 2)
+  horizons: {3m: 63, 6m: 126, 12m: 252}
+  primary: 12m                 # training label = cross-sectional rank of excess_12m
+  winsorize: [0.01, 0.99]      # per-date quantiles for the raw excess_* kept for calibration
+  vol_min_obs: 21              # fewer daily returns than this in the window -> realized vol is null
+  # A stock that is not delisted but has no price within this many trading days of the window
+  # end has a data gap, not a known outcome: its label is null rather than guessed.
+  stale_price_days: 5
+  barriers:
+    horizon: 12m
+    k_tp: [0.75, 1.0, 1.5, 2.0, null]   # null = no take-profit
+    k_sl: [0.5, 0.75, 1.0, 1.5, null]   # null = no stop
+    tp_bounds: [0.10, 1.00]             # TP distance from entry is kept inside these
+    sl_bounds: [0.08, 0.40]
+    # sigma = trailing 12m realized vol (point-in-time) until Phase 6 forecasts volatility
+    sigma_window: 252
+    sigma_min_obs: 126
+
 quality:
   max_daily_move_without_action: 0.5
   max_monthly_count_change: 0.10

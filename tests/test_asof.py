@@ -13,8 +13,8 @@ d = dt.date
 @pytest.mark.parametrize(
     ("published", "lag", "expected"),
     [
-        (d(2019, 8, 2), 1, d(2019, 8, 5)),   # Friday filing -> Monday
-        (d(2019, 8, 3), 1, d(2019, 8, 5)),   # Saturday filing -> Monday
+        (d(2019, 8, 2), 1, d(2019, 8, 5)),   # friday filing -> monday
+        (d(2019, 8, 3), 1, d(2019, 8, 5)),   # saturday filing -> monday
         (d(2019, 8, 5), 1, d(2019, 8, 6)),
         (d(2019, 8, 5), 2, d(2019, 8, 7)),
         (d(2019, 8, 5), 0, d(2019, 8, 5)),

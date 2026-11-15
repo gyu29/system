@@ -18,6 +18,8 @@ CORE_TABLES = (
     "benchmark_daily",
     "labels",
     "barrier_labels",
+    "features_raw",
+    "features",
 )
 
 # Tables partitioned by year, and the date column that decides the partition.
@@ -29,6 +31,8 @@ PARTITION_COL = {
     "benchmark_daily": "date",
     "labels": "date",
     "barrier_labels": "date",
+    "features_raw": "date",
+    "features": "date",
 }
 
 

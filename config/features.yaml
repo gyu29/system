@@ -1,0 +1,435 @@
+# Feature catalog (plan section 3). One entry per model feature: definition, source fields, lookback,
+# availability lag and the supporting paper. Adding, removing or redefining a feature after Phase 5
+# counts as a trial. The plan allows 30-45 features: resist adding more.
+#
+# Conventions
+# - t is the prediction date: the close of the last trading day of a month.
+# - SF1 dimensions are as first reported, never restated: ARQ = quarterly, ART = trailing twelve months
+#   (updated every quarter), ARY = fiscal year. A filing is usable from the trading day after its filing
+#   date; a filing more than 550 days old at t is stale and the feature is null.
+# - "t-k months" is the month-end trading day k months before t (not 21*k trading days).
+# - market_cap(t) is DAILY.marketcap at t (at most 7 calendar days old).
+# - A ratio whose denominator is zero, or negative where that is meaningless, is null.
+# - sign: +1 = high values have historically preceded high returns, -1 = the opposite. Ranks are not
+#   sign-flipped; the sign is read only by the factor-composite baseline and the explanations.
+# - kind: stock = ranked across stocks on each date; context = one value per date, not ranked.
+
+families:   # order = report order
+  value: {label: Value, sector_relative: true}
+  quality: {label: "Profitability / quality", sector_relative: true}
+  investment: {label: "Investment / issuance"}
+  momentum: {label: Momentum}
+  reversal: {label: "Long-term reversal"}
+  earnings: {label: "Earnings dynamics"}
+  risk: {label: Risk}
+  health: {label: "Financial health"}
+  size: {label: "Size / liquidity"}
+  context: {label: "Market context (date-level)"}
+
+features:
+  # ---- value ----
+  - name: book_to_price
+    family: value
+    label: Book/price
+    definition: "Book equity from the latest quarterly balance sheet / market_cap(t)"
+    source: ["SF1.equity (ARQ)", "DAILY.marketcap"]
+    lookback: latest quarter
+    lag: "filing date + 1 trading day; market cap at t"
+    citation: "Fama & French (1992)"
+    sign: 1
+    kind: stock
+
+  - name: earnings_yield
+    family: value
+    label: Earnings yield
+    definition: "Trailing-twelve-month net income / market_cap(t)"
+    source: ["SF1.netinc (ART)", "DAILY.marketcap"]
+    lookback: trailing 12 months
+    lag: "filing date + 1 trading day; market cap at t"
+    citation: "Basu (1977); Fama & French (1992); Lakonishok, Shleifer & Vishny (1994)"
+    sign: 1
+    kind: stock
+
+  - name: fcf_yield
+    family: value
+    label: Free-cash-flow yield
+    definition: "Trailing-twelve-month free cash flow (operating cash flow less capex) / market_cap(t)"
+    source: ["SF1.fcf (ART)", "DAILY.marketcap"]
+    lookback: trailing 12 months
+    lag: "filing date + 1 trading day; market cap at t"
+    citation: "Lakonishok, Shleifer & Vishny (1994)"
+    sign: 1
+    kind: stock
+
+  - name: ebitda_to_ev
+    family: value
+    label: EBITDA/EV
+    definition: "Trailing-twelve-month EBITDA / EV(t), where EV(t) = market_cap(t) + total debt - cash and equivalents from the latest quarter; null if EV(t) <= 0"
+    source: ["SF1.ebitda (ART)", "SF1.debt (ARQ)", "SF1.cashneq (ARQ)", "DAILY.marketcap"]
+    lookback: trailing 12 months (flow); latest quarter (debt, cash)
+    lag: "filing date + 1 trading day; market cap at t"
+    citation: "Loughran & Wellman (2011); Lakonishok, Shleifer & Vishny (1994)"
+    sign: 1
+    kind: stock
+
+  - name: sales_to_ev
+    family: value
+    label: Sales/EV
+    definition: "Trailing-twelve-month revenue / EV(t), where EV(t) = market_cap(t) + total debt - cash and equivalents from the latest quarter; null if EV(t) <= 0"
+    source: ["SF1.revenue (ART)", "SF1.debt (ARQ)", "SF1.cashneq (ARQ)", "DAILY.marketcap"]
+    lookback: trailing 12 months (flow); latest quarter (debt, cash)
+    lag: "filing date + 1 trading day; market cap at t"
+    citation: "Barbee, Mukherji & Raines (1996); Lakonishok, Shleifer & Vishny (1994)"
+    sign: 1
+    kind: stock
+
+  - name: shareholder_yield
+    family: value
+    label: Shareholder yield
+    definition: "Trailing-twelve-month cash returned to shareholders (dividends paid + net share repurchases) / market_cap(t) = -(ncfdiv + ncfcommon) / market_cap(t); both are cash flows, negative when cash leaves the company"
+    source: ["SF1.ncfdiv (ART)", "SF1.ncfcommon (ART)", "DAILY.marketcap"]
+    lookback: trailing 12 months
+    lag: "filing date + 1 trading day; market cap at t"
+    citation: "Boudoukh, Michaely, Richardson & Roberts (2007)"
+    sign: 1
+    kind: stock
+
+  # ---- profitability / quality ----
+  - name: gross_profitability
+    family: quality
+    label: Gross profits/assets
+    definition: "Trailing-twelve-month gross profit / total assets from the latest quarter"
+    source: ["SF1.gp (ART)", "SF1.assets (ARQ)"]
+    lookback: trailing 12 months (flow); latest quarter (assets)
+    lag: "filing date + 1 trading day"
+    citation: "Novy-Marx (2013)"
+    sign: 1
+    kind: stock
+
+  - name: roic
+    family: quality
+    label: Return on invested capital
+    definition: "Trailing-twelve-month EBIT x (1 - 0.21) / invested capital from the latest quarter; null if invested capital <= 0"
+    source: ["SF1.ebit (ART)", "SF1.invcap (ARQ)"]
+    lookback: trailing 12 months (flow); latest quarter (capital)
+    lag: "filing date + 1 trading day"
+    citation: "Novy-Marx (2013); Fama & French (2015)"
+    sign: 1
+    kind: stock
+
+  - name: op_margin_stability
+    family: quality
+    label: Operating-margin volatility
+    definition: "Standard deviation of the annual operating margin (operating income / revenue) over the last 5 fiscal years (at least 3); a low value means stable margins"
+    source: ["SF1.opinc (ARY)", "SF1.revenue (ARY)"]
+    lookback: 5 fiscal years
+    lag: "filing date + 1 trading day"
+    citation: "Asness, Frazzini & Pedersen (2019); Novy-Marx (2013)"
+    sign: -1
+    kind: stock
+
+  - name: piotroski_f
+    family: quality
+    label: Piotroski F-score
+    definition: "Sum of Piotroski's nine binary signals, latest fiscal year vs the one before: return on assets > 0, operating cash flow > 0, return on assets up, operating cash flow > net income, leverage (long-term debt / assets) down, current ratio up, no new shares issued, gross margin up, asset turnover up"
+    source: ["SF1.netinc (ARY)", "SF1.ncfo (ARY)", "SF1.assets (ARY)", "SF1.debtnc (ARY)", "SF1.assetsc (ARY)", "SF1.liabilitiesc (ARY)", "SF1.shareswa (ARY)", "SF1.gp (ARY)", "SF1.revenue (ARY)"]
+    lookback: 2 fiscal years
+    lag: "filing date + 1 trading day"
+    citation: "Piotroski (2000)"
+    sign: 1
+    kind: stock
+
+  - name: accruals
+    family: quality
+    label: Accruals
+    definition: "(Trailing-twelve-month net income - operating cash flow) / total assets from the latest quarter; high accruals mean earnings not backed by cash"
+    source: ["SF1.netinc (ART)", "SF1.ncfo (ART)", "SF1.assets (ARQ)"]
+    lookback: trailing 12 months (flow); latest quarter (assets)
+    lag: "filing date + 1 trading day"
+    citation: "Sloan (1996)"
+    sign: -1
+    kind: stock
+
+  # ---- investment / issuance ----
+  - name: asset_growth
+    family: investment
+    label: Asset growth
+    definition: "Total assets in the latest quarter / total assets four quarters earlier - 1"
+    source: ["SF1.assets (ARQ)"]
+    lookback: 1 year
+    lag: "filing date + 1 trading day"
+    citation: "Cooper, Gulen & Schill (2008)"
+    sign: -1
+    kind: stock
+
+  - name: net_issuance
+    family: investment
+    label: Net share issuance
+    definition: "log(split-adjusted shares outstanding in the latest quarter / four quarters earlier); shares are sharesbas / the cumulative split factor up to its fiscal period end, so a split is not counted as issuance"
+    source: ["SF1.sharesbas (ARQ)", "ACTIONS.split"]
+    lookback: 1 year
+    lag: "filing date + 1 trading day"
+    citation: "Pontiff & Woodgate (2008)"
+    sign: -1
+    kind: stock
+
+  - name: capex_growth
+    family: investment
+    label: Capex growth
+    definition: "|Trailing-twelve-month capital expenditure| / |the same one year earlier| - 1; capex is a cash outflow (negative), so absolute values are compared"
+    source: ["SF1.capex (ART)"]
+    lookback: 2 years
+    lag: "filing date + 1 trading day"
+    citation: "Titman, Wei & Xie (2004); Cooper, Gulen & Schill (2008)"
+    sign: -1
+    kind: stock
+
+  # ---- momentum ----
+  - name: mom_12_1
+    family: momentum
+    label: 12-1 month momentum
+    definition: "Total return from t-12 months to t-1 month (month-end total-return prices), skipping the latest month"
+    source: ["SEP.closeadj"]
+    lookback: 12 months
+    lag: "none: prices through t-1 month"
+    citation: "Jegadeesh & Titman (1993)"
+    sign: 1
+    kind: stock
+
+  - name: mom_6_1
+    family: momentum
+    label: 6-1 month momentum
+    definition: "Total return from t-6 months to t-1 month (month-end total-return prices), skipping the latest month"
+    source: ["SEP.closeadj"]
+    lookback: 6 months
+    lag: "none: prices through t-1 month"
+    citation: "Jegadeesh & Titman (1993)"
+    sign: 1
+    kind: stock
+
+  - name: ind_mom_6m
+    family: momentum
+    label: Industry 6-month momentum
+    definition: "Equal-weight mean of the 6-month total return (t-6 months to t) over the universe members at t in the same Fama industry (sector when the industry is missing); null with fewer than 5 names"
+    source: ["SEP.closeadj", "TICKERS.famaindustry", "TICKERS.sector"]
+    lookback: 6 months
+    lag: "none: prices through the close of t"
+    citation: "Moskowitz & Grinblatt (1999)"
+    sign: 1
+    kind: stock
+
+  - name: high_52w
+    family: momentum
+    label: 52-week-high proximity
+    definition: "Total-return price at t / its highest value over the trailing 252 trading days (1.0 = at the high)"
+    source: ["SEP.closeadj"]
+    lookback: 252 trading days
+    lag: "none: prices through the close of t"
+    citation: "George & Hwang (2004)"
+    sign: 1
+    kind: stock
+
+  # ---- long-term reversal ----
+  - name: rev_36_12
+    family: reversal
+    label: Long-term reversal (36-12 month return)
+    definition: "Total return from t-36 months to t-12 months (month-end total-return prices), excluding the latest 12 months"
+    source: ["SEP.closeadj"]
+    lookback: 36 months
+    lag: "none: prices through t-12 months"
+    citation: "De Bondt & Thaler (1985)"
+    sign: -1
+    kind: stock
+
+  # ---- earnings dynamics ----
+  - name: sue
+    family: earnings
+    label: Earnings surprise (SUE)
+    definition: "Standardized unexpected earnings: (quarterly EPS - EPS four quarters earlier) / standard deviation of the 8 year-over-year changes before it, excluding the latest (at least 6)"
+    source: ["SF1.eps (ARQ)"]
+    lookback: 13 quarters
+    lag: "filing date + 1 trading day"
+    citation: "Bernard & Thomas (1989)"
+    sign: 1
+    kind: stock
+
+  - name: eps_growth_stability
+    family: earnings
+    label: EPS growth volatility
+    definition: "Standard deviation of the year-over-year change in annual EPS, scaled by the mean |EPS|, over the last 3-4 fiscal years; a low value means steady earnings growth"
+    source: ["SF1.eps (ARY)"]
+    lookback: 4 fiscal years
+    lag: "filing date + 1 trading day"
+    citation: "Dichev & Tang (2009); Bernard & Thomas (1989)"
+    sign: -1
+    kind: stock
+
+  # ---- risk ----
+  - name: vol_1y
+    family: risk
+    label: 1-year volatility
+    definition: "Annualized standard deviation of daily log total returns over the trailing 252 trading days (at least 126 observations)"
+    source: ["SEP.closeadj"]
+    lookback: 252 trading days
+    lag: "none: prices through the close of t"
+    citation: "Ang, Hodrick, Xing & Zhang (2006)"
+    sign: -1
+    kind: stock
+
+  - name: idio_vol
+    family: risk
+    label: Idiosyncratic volatility
+    definition: "Annualized standard deviation of the residuals from a 252-trading-day regression of the stock's daily return on the universe benchmark return (market model; the Fama-French size and value factors are not ingested)"
+    source: ["SEP.closeadj", "benchmark_daily.bench_ret"]
+    lookback: 252 trading days
+    lag: "none: prices through the close of t"
+    citation: "Ang, Hodrick, Xing & Zhang (2006)"
+    sign: -1
+    kind: stock
+
+  - name: beta_60m
+    family: risk
+    label: Market beta (60 months)
+    definition: "Slope of the stock's monthly total return on the universe benchmark's monthly return over the trailing 60 months (at least 24)"
+    source: ["SEP.closeadj", "benchmark_daily.bench_level"]
+    lookback: 60 months
+    lag: "none: prices through the close of t"
+    citation: "Frazzini & Pedersen (2014)"
+    sign: -1
+    kind: stock
+
+  - name: max_ret_1m
+    family: risk
+    label: Max daily return (1 month)
+    definition: "Largest daily total return over the trailing 21 trading days (lottery-like payoffs)"
+    source: ["SEP.closeadj"]
+    lookback: 21 trading days
+    lag: "none: prices through the close of t"
+    citation: "Bali, Cakici & Whitelaw (2011)"
+    sign: -1
+    kind: stock
+
+  # ---- financial health ----
+  - name: debt_to_assets
+    family: health
+    label: Debt/assets
+    definition: "Total debt / total assets from the latest quarter"
+    source: ["SF1.debt (ARQ)", "SF1.assets (ARQ)"]
+    lookback: latest quarter
+    lag: "filing date + 1 trading day"
+    citation: "Campbell, Hilscher & Szilagyi (2008)"
+    sign: -1
+    kind: stock
+
+  - name: interest_coverage
+    family: health
+    label: Interest coverage
+    definition: "Trailing-twelve-month EBIT / |trailing-twelve-month interest expense|; null if interest expense is zero"
+    source: ["SF1.ebit (ART)", "SF1.intexp (ART)"]
+    lookback: trailing 12 months
+    lag: "filing date + 1 trading day"
+    citation: "Campbell, Hilscher & Szilagyi (2008)"
+    sign: 1
+    kind: stock
+
+  - name: altman_z
+    family: health
+    label: Altman Z-score
+    definition: "1.2 x working capital/assets + 1.4 x retained earnings/assets + 3.3 x EBIT/assets + 0.6 x market_cap(t)/total liabilities + 1.0 x revenue/assets (EBIT and revenue trailing twelve months, balance sheet from the latest quarter); a high score means low distress risk"
+    source: ["SF1.workingcapital (ARQ)", "SF1.retearn (ARQ)", "SF1.assets (ARQ)", "SF1.liabilities (ARQ)", "SF1.ebit (ART)", "SF1.revenue (ART)", "DAILY.marketcap"]
+    lookback: trailing 12 months (flows); latest quarter (balance sheet)
+    lag: "filing date + 1 trading day; market cap at t"
+    citation: "Altman (1968); Campbell, Hilscher & Szilagyi (2008)"
+    sign: 1
+    kind: stock
+
+  - name: cash_to_assets
+    family: health
+    label: Cash/assets
+    definition: "Cash and equivalents / total assets from the latest quarter"
+    source: ["SF1.cashneq (ARQ)", "SF1.assets (ARQ)"]
+    lookback: latest quarter
+    lag: "filing date + 1 trading day"
+    citation: "Campbell, Hilscher & Szilagyi (2008)"
+    sign: 1
+    kind: stock
+
+  # ---- size / liquidity ----
+  - name: log_mcap
+    family: size
+    label: Market cap (log)
+    definition: "Natural log of market_cap(t) in dollars"
+    source: ["DAILY.marketcap"]
+    lookback: none
+    lag: "none: market cap at t"
+    citation: "Banz (1981)"
+    sign: -1
+    kind: stock
+
+  - name: amihud
+    family: size
+    label: Amihud illiquidity
+    definition: "Mean over the trailing 252 trading days (at least 126) of |daily return| / dollar volume (close x volume), x 1e6: the price move per million dollars traded"
+    source: ["SEP.closeadj", "SEP.close", "SEP.volume"]
+    lookback: 252 trading days
+    lag: "none: prices through the close of t"
+    citation: "Amihud (2002)"
+    sign: 1
+    kind: stock
+
+  - name: turnover
+    family: size
+    label: Share turnover
+    definition: "Mean daily share volume over the trailing 63 trading days / shares outstanding, with shares outstanding = market_cap(t) / close(t)"
+    source: ["SEP.volume", "SEP.close", "DAILY.marketcap"]
+    lookback: 63 trading days
+    lag: "none: prices through the close of t"
+    citation: "Datar, Naik & Radcliffe (1998)"
+    sign: -1
+    kind: stock
+
+  # ---- context (date-level; lets trees learn regime interactions, never used alone) ----
+  # `sign` is required by the schema but is not read for context features.
+  - name: term_spread
+    family: context
+    label: Term spread
+    definition: "10-year Treasury yield minus 3-month Treasury yield (percentage points), latest values published by t"
+    source: ["FRED.DGS10", "FRED.DGS3MO"]
+    lookback: none
+    lag: "FRED available_date <= t (daily series, published the next day)"
+    citation: "Fama & French (1989)"
+    sign: 1
+    kind: context
+
+  - name: credit_spread
+    family: context
+    label: Credit spread
+    definition: "Moody's Baa corporate yield minus the 10-year Treasury yield (percentage points), latest value published by t"
+    source: ["FRED.BAA10Y"]
+    lookback: none
+    lag: "FRED available_date <= t (daily series, published the next day)"
+    citation: "Fama & French (1989)"
+    sign: 1
+    kind: context
+
+  - name: mkt_ret_12m
+    family: context
+    label: Market 12-month return
+    definition: "Return of the cap-weighted universe benchmark over the trailing 252 trading days: bench_level(t) / bench_level(t - 252 trading days) - 1"
+    source: ["benchmark_daily.bench_level"]
+    lookback: 252 trading days
+    lag: "none: benchmark through the close of t"
+    citation: "Cooper, Gutierrez & Hameed (2004)"
+    sign: 1
+    kind: context
+
+  - name: xs_dispersion
+    family: context
+    label: Cross-sectional dispersion
+    definition: "Standard deviation across the universe members at t of their trailing 21-trading-day total returns"
+    source: ["SEP.closeadj", "universe.in_universe"]
+    lookback: 21 trading days
+    lag: "none: prices through the close of t"
+    citation: "Stivers & Sun (2010)"
+    sign: 1
+    kind: context

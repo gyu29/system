@@ -167,3 +167,41 @@ def macro(cfg) -> pl.DataFrame:
 
     cpi = next(s for s in cfg.macro if s.id == "CPIAUCSL")
     return parse_observations(cpi_payload(), cpi)
+
+
+def run_synthetic_pipeline(
+    root: Path,
+    *,
+    n_stocks: int,
+    start: dt.date,
+    end: dt.date,
+    seed: int = 0,
+    dev_end: dt.date,
+    holdout_start: dt.date,
+    holdout_end: dt.date,
+    steps: tuple[str, ...] = ("build", "labels", "features"),
+):
+    """Simulated vendor data pushed through the real CLI (ingest synthetic -> `steps`) under `root`.
+    Returns (config, {command: output}). Shared by the feature-build, leakage and end-to-end tests."""
+    from typer.testing import CliRunner
+
+    from ltforecast.cli import app
+
+    raw = yaml.safe_load(DEFAULT_CONFIG.read_text())
+    raw["data_dir"] = str(root / "data")
+    raw["dates"].update(
+        history_start=start.replace(day=1), dev_end=dev_end, holdout_start=holdout_start, holdout_end=holdout_end
+    )
+    raw["universe"]["cpi_base_date"] = end
+    path = root / "config" / "universe.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(yaml.safe_dump(raw))
+
+    runner, outputs = CliRunner(), {}
+    ingest = ["ingest", "synthetic", "--n-stocks", str(n_stocks), "--start", start.isoformat(),
+              "--end", end.isoformat(), "--seed", str(seed)]
+    for args in (ingest, *([s] for s in steps)):
+        result = runner.invoke(app, [*args, "--config", str(path)])
+        assert result.exit_code == 0, f"ltforecast {' '.join(args)} failed:\n{result.output}\n{result.exception!r}"
+        outputs[args[-1] if len(args) == 1 else "ingest"] = result.output
+    return load_config(path), outputs

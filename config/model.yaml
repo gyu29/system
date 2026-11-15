@@ -1,0 +1,33 @@
+# Validation rules, metric settings and the success criteria (plan sections 0 and 4).
+#
+# The `criteria` block is PRE-REGISTERED (plan section 0): it was fixed before any model existed and
+# must never be tuned, loosened or re-interpreted after seeing a result. Everything else here was
+# also fixed before Phase 5; changing it afterwards counts as a trial in the experiment log.
+
+validation:
+  # Walk-forward, expanding window, refit once a year (plan 4.1).
+  first_test_year: 2010      # leaves 2000-01 -> 2008-11 (107 months) to train the first fold
+  test_months: 12            # calendar-year test folds; the last fold ends at dates.dev_end (may be partial)
+  purge_months: 12           # = the 12m label horizon: a training label must end before the test year starts
+  embargo_months: 1          # one more month on top of the purge (plan 4.1)
+  min_train_months: 60       # a fold with less than 5 years of training dates is skipped
+  # Inner validation (early stopping, tuning): the last 24 training months, separated from the rest
+  # of the training window by the same purge + embargo. It never touches the test year (plan 4.1).
+  inner_valid_months: 24
+
+metrics:
+  nw_lags: 12                # Newey-West lags for the IC t-stat: 12m labels overlap for 12 months (plan 0, 4.2)
+  n_deciles: 10              # decile table and top-minus-bottom spread (plan 4.2)
+  prob_bins: 10              # bins of the P(beat market) calibration table (plan 4.2)
+
+criteria:                    # plan section 0, pre-registered — never tune these
+  min_rank_ic: 0.04                 # criterion 1: mean monthly rank IC
+  min_ic_tstat: 2.0                 # criterion 1: Newey-West t-stat of the IC (metrics.nw_lags lags)
+  min_positive_spread_years: 0.65   # criterion 2: share of years with a positive decile 10 - decile 1 spread
+  coverage_range: [0.75, 0.85]      # criterion 4: realized coverage of the 10-90% interval (target 0.80)
+  calibration_tolerance: 0.05       # criterion 5: |realized - stated| P(beat market), e.g. 60% -> 55-65%
+  tpsl_prob_tolerance: 0.05         # criterion 6: P(TP hit first) calibrated within +/- 5 points
+
+costs_bps: 20                # one-way trading cost in every simulation (plan 6.5 and 7)
+
+experiments_dir: experiments # run log + trial counter (plan 4.3); relative to the repo root

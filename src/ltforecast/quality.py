@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from ltforecast.store import Store
 @dataclass(frozen=True)
 class CheckResult:
     name: str
-    status: str  # pass | warn | fail
+    status: str  # pass | warn | fail | skip (not evaluated: neither a pass nor a failure)
     detail: str
 
 
@@ -57,12 +58,76 @@ def check_split_consistency(prices: pl.DataFrame, tol: float = 0.01) -> CheckRes
     return _result("split_consistency", bad.height == 0, f"{bad.height} unexplained adjustment-ratio changes", severity="warn")
 
 
+def check_share_basis(fund: pl.DataFrame, prices: pl.DataFrame, max_err: float = math.log(1.5)) -> CheckResult:
+    """SF1 share counts must be on the share basis of their own filing date (every split with ex-date
+    before `available_date`), not restated for later splits: the feature helpers
+    (`features.investment.split_adjusted_context`, `features.earnings.split_adjusted_eps_context`) rely on it.
+
+    For consecutive first-filed ARQ `sharesbas` values of a security, filed on F_prev < F, with splits of
+    combined factor k != 1 dated in [F_prev, F), the raw ratio r = sharesbas(F) / sharesbas(F_prev) should
+    be about k. Warns when the median |log(r / k)| over those split events exceeds `max_err`; r of about 1
+    means the vendor restates counts and the split division in those helpers must go. Skips when no split
+    falls between two filings."""
+    counts = (
+        fund.lazy()
+        .filter((pl.col("dimension") == "ARQ") & (pl.col("metric") == "sharesbas") & (pl.col("value") > 0))
+        .sort("security_id", "fiscal_period_end", "available_date")
+        .group_by("security_id", "fiscal_period_end", maintain_order=True)
+        .first()
+        .select("security_id", "available_date", "value")
+        .sort("security_id", "available_date")
+        .with_columns(
+            pl.col("available_date").shift(1).over("security_id").alias("prev_date"),
+            pl.col("value").shift(1).over("security_id").alias("prev_value"),
+        )
+        .drop_nulls("prev_date")
+        .collect()
+    )
+    splits = (
+        prices.lazy()
+        .filter(pl.col("split_factor").is_not_null() & (pl.col("split_factor") != 1.0))
+        .select("security_id", pl.col("date").alias("split_date"), "split_factor")
+        .sort("security_id", "split_date")
+        .with_columns(pl.col("split_factor").log().cum_sum().over("security_id").alias("_cum"))
+        .collect()
+    )
+
+    def cum_before(df: pl.DataFrame, on: str, name: str) -> pl.DataFrame:
+        return (
+            df.sort("security_id", on)
+            .join_asof(splits.select("security_id", "split_date", "_cum"), left_on=on, right_on="split_date",
+                       by="security_id", strategy="backward", allow_exact_matches=False, check_sortedness=False)
+            .with_columns(pl.col("_cum").fill_null(0.0).alias(name))
+            .drop("split_date", "_cum")
+        )
+
+    events = (
+        cum_before(cum_before(counts, "available_date", "_now"), "prev_date", "_prev")
+        .with_columns((pl.col("_now") - pl.col("_prev")).alias("log_k"))
+        .filter(pl.col("log_k").abs() > 1e-9)
+        .with_columns(((pl.col("value") / pl.col("prev_value")).log() - pl.col("log_k")).abs().alias("err"))
+    )
+    if events.height == 0:
+        return CheckResult("share_basis", "skip", "no split between two consecutive ARQ filings")
+    med = float(events["err"].median())
+    return _result(
+        "share_basis", med <= max_err,
+        f"{events.height} split events; median |log(shares ratio / split factor)| = {med:.3f} (limit {max_err:.3f})",
+        severity="warn",
+    )
+
+
 def universe_counts(universe: pl.DataFrame) -> pl.DataFrame:
     return universe.group_by("date").agg(pl.col("in_universe").sum().alias("n")).sort("date")
 
 
 def check_universe_counts(universe: pl.DataFrame, max_change: float) -> CheckResult:
-    counts = universe_counts(universe).with_columns((pl.col("n") / pl.col("n").shift(1) - 1).alias("chg"))
+    # Months before the universe first has members are ADV/history warm-up, not a vendor coverage change.
+    counts = (
+        universe_counts(universe)
+        .filter((pl.col("n") > 0).cum_max())
+        .with_columns((pl.col("n") / pl.col("n").shift(1) - 1).alias("chg"))
+    )
     jumps = counts.filter(pl.col("chg").abs() > max_change)
     return _result(
         "universe_count_stability",
@@ -136,6 +201,7 @@ def run_all(store: Store, cfg: Config, report_dir: Path | None = None) -> list[C
         check_no_future_available(fund, macro, dt.date.today()),
         check_price_jumps(prices, q.max_daily_move_without_action),
         check_split_consistency(prices),
+        check_share_basis(fund, prices),
         check_universe_counts(universe, q.max_monthly_count_change),
         check_universe_size(universe),
         check_delisted_present(universe, securities),

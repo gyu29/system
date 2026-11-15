@@ -9,10 +9,22 @@ export FRED_API_KEY=...               # free, https://fred.stlouisfed.org/docs/a
 .venv/bin/ltforecast build            # data/core/<table>/year=YYYY/*.parquet
 .venv/bin/ltforecast check            # exits 1 on any FAIL; writes data/reports/{coverage,spot_check}.csv
 .venv/bin/ltforecast labels           # data/core/{labels,benchmark_daily,barrier_labels}
+.venv/bin/ltforecast features         # data/core/{features_raw,features}; data/reports/feature_{ic,shift_test}.csv
 .venv/bin/pytest
 ```
 
-Config (universe filters, holdout dates, PIT, delisting and label rules): `config/universe.yaml`.
+Without vendor keys, `.venv/bin/ltforecast ingest synthetic [--n-stocks 300 --start 2000-01-03 --end 2025-12-31 --seed 0]`
+replaces the two downloads with simulated vendor-shaped data that carries a modest planted signal
+(parameters are recorded in `data/raw/SYNTHETIC.json`); every later command runs unchanged.
+Real and synthetic raw data never mix: `ingest synthetic` refuses to overwrite vendor raw files unless
+given `--force`, and `ingest sharadar` / `ingest fred` refuse to write over synthetic raw data unless
+given `--replace-synthetic` (which deletes all synthetic raw files first). `build` records where the
+core tables came from in `data/core/PROVENANCE.json` (`{"synthetic": true, ...}` plus a printed
+SYNTHETIC DATA warning, or `{"synthetic": false}`).
+
+Config: `config/universe.yaml` (universe filters, holdout dates, PIT, delisting and label rules),
+`config/features.yaml` (the feature catalog), `config/model.yaml` (validation rules and the
+pre-registered success criteria).
 
 ## Labels (`labels.py`, `levels.py`)
 
@@ -30,6 +42,44 @@ One row per in-universe (stock, month end); horizons 3m/6m/12m = 63/126/252 trad
 - `barrier_labels`: 25 TP/SL pairs per entry. Closes are checked daily. A gap through a level fills at
   the open; otherwise the fill is at the level. **σ is trailing 12m realized vol for now**, and becomes
   the forecast vol in Phase 6, when these labels get rebuilt.
+
+## Features (`features/`)
+
+One row per in-universe (stock, month end). `config/features.yaml` is the catalog: 36 features in ten
+families, each with its definition, source fields, lookback, availability lag and citation.
+
+- `features_raw`: the unranked values plus one `src_date_<family>` per family, the latest date of any
+  input behind that row. The build fails if a source date is after the prediction date.
+- `features`: what the models read. Stock features are ranked across stocks on each date into
+  (−0.5, 0.5); value and quality also get a within-sector rank (`<name>_sr`). Missing stays null, with a
+  `has_<family>` flag; linear models impute 0, the median rank. Ranks are never sign-flipped: the
+  expected sign is in the catalog. The four context features are date-level and left unranked.
+- Fundamentals are the latest fiscal period whose filing was usable at t (filing date + 1 trading
+  day), as the market saw it then, and go null once the filing is older than 550 days. Price features
+  use data through the month-end close only. Share counts and EPS are put on one split basis.
+- `ltforecast features` also writes two development-period reports: the univariate rank IC of every
+  feature (`feature_ic.csv`) and the shift test (`feature_shift_test.csv`), which flags a feature whose
+  IC clearly improves when its value is made one month staler, in whichever direction the feature
+  predicts (`orientation`, from the data; `gain` and `gain_tstat` are the oriented improvement and its
+  Newey-West t-stat), so a feature and its negation get the same verdict. `leakage.shuffle_labels` permutes the
+  labels within each date for the random-label test.
+
+## Validation (`dataset.py`, `validation/`)
+
+- `dataset.modeling_frame` joins features to labels and returns development rows only. Gap and holdout
+  rows need a `HoldoutToken`, which nothing before the Phase 9 evaluation can issue.
+- `splitter.walk_forward_folds`: expanding window, one test year per fold from 2010, with 12 purged
+  months plus a 1-month embargo between the last training date and the test year. Inner validation is
+  the last 24 training months, purged the same way. `assert_purged` checks every training label ends
+  before the first test date.
+- `runner.walk_forward` fits a fresh model per fold and scores the test rows from a frame with every
+  label column removed.
+- `metrics.py`: monthly rank IC with a Newey-West t-stat (12 lags), decile table and top-minus-bottom
+  spread by year, calibration, interval coverage, size and regime breakdowns, deflated Sharpe, and
+  `check_criteria` against the thresholds in `config/model.yaml`. Those thresholds are pre-registered
+  and are never tuned.
+- `experiments.log_run` appends every run to `experiments/runs.csv` (config hash, git commit, metrics,
+  trial count); the trial count feeds the deflated Sharpe.
 
 ## Point-in-time rules enforced in code
 
@@ -50,3 +100,9 @@ These are encoded in code/config but were only tested against synthetic data:
 3. `ACTIONS` uses the same tickers as `TICKERS(table=SEP)`, with delisting codes
    `bankruptcyliquidation`, `regulatorydelisting`, `voluntarydelisting`, `acquisitionby`, `mergerfrom`, `delisted`.
 4. Sector/industry come from `TICKERS`, which is current-only — not historical as the plan asks.
+5. SF1 AR* `sharesbas`, `shareswa`, `eps`, `epsdil` and `dps` are as first reported: on the share basis
+   of every split with ex-date before the filing date (`datekey`), and not restated for later splits.
+   `features.investment.split_adjusted_context` (also used by the Piotroski score in `features/quality.py`)
+   and `features.earnings.split_adjusted_eps_context` depend on this. SF1 `sharefactor` is not a
+   split-basis marker. (`check` → `share_basis` verifies it: a raw share ratio of about 1 across a split
+   means the counts are restated, and the split division in those helpers must be removed.)

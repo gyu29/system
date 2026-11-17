@@ -43,8 +43,9 @@ class PlantedMix:
 
     name = "planted_mix"
 
-    def fit(self, train, valid):
+    def fit(self, train, valid, *, full=None):
         assert train["target"].null_count() == 0 and valid["target"].null_count() == 0
+        assert full is not None and full["target"].null_count() == 0
         return self
 
     def predict(self, df):

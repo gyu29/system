@@ -474,8 +474,10 @@ def check_criteria(
                      a Newey-West t-stat >= criteria.min_ic_tstat;
     coverage         `interval_coverage` of the 10-90% range, for criterion 4;
     calibration_gap  `max_calibration_gap` of P(beat market), for criterion 5;
-    tpsl             criterion 6: {"beats_hold": the chosen TP/SL pair beats plain holding on mean net
-                     Sharpe and is no worse on max drawdown (exits verdict "exit_orders"),
+    tpsl             criterion 6: {"beats_hold": the exits verdict is "exit_orders", i.e. out of sample
+                     (pair picked on the other folds, scored on each held-out fold) the pair beats
+                     plain holding on mean net Sharpe, is no worse on mean max drawdown, and the
+                     Newey-West t of the daily difference is >= 2 (exits.holdout_verdict),
                      "p_gap": the largest `max_calibration_gap` over the hit classes the pair has
                      (hitprob.hit_calibration; "p_tp_gap" is read when "p_gap" is absent),
                      optional "p_gap_class" (tp | sl | time, the class giving p_gap), "p_tested"

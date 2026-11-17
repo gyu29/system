@@ -398,3 +398,24 @@ def test_hit_calibration_min_bin_rows_unmet_gives_nan():
     r = hit_calibration(df, k_tp=1.0, k_sl=1.0, bins=10, min_bin_rows=50)
     assert r["applicable"] is True
     assert np.isnan(r["gap"]) and r["worst"] is None
+
+
+def test_unknown_outcomes_are_not_scored_or_certified():
+    # a stale barrier path has outcome null (unknown): it is neither a 'time' label nor scored
+    rng = np.random.default_rng(1)
+    n = 60
+    out = rng.choice(list(CLASSES), n).astype(object)
+    p = rng.dirichlet([1, 1, 1], n)
+    known = pl.DataFrame({"date": [dt.date(2015, 1, 31)] * n, "security_id": np.arange(n), "outcome": out})
+    unknown = known.with_columns(pl.when(pl.col("security_id") < 20).then(None).otherwise(pl.col("outcome"))
+                                 .alias("outcome"))
+    _, tab = choose_method(_oof(p), _oof(p[::-1].copy()), unknown)
+    _, ref = choose_method(_oof(p[20:]).with_columns(pl.col("security_id") + 20),
+                           _oof(p[::-1][20:].copy()).with_columns(pl.col("security_id") + 20), known.slice(20))
+    assert tab["n"].to_list() == [40] * 3
+    np.testing.assert_allclose(tab["brier"].to_numpy(), ref["brier"].to_numpy())
+    hits = _hits(p[:, 0], p[:, 1], p[:, 2], unknown["outcome"].to_list())
+    r = hit_calibration(hits, k_tp=1.0, k_sl=1.0, bins=5)
+    r_ref = hit_calibration(_hits(p[20:, 0], p[20:, 1], p[20:, 2], out[20:].tolist()), k_tp=1.0, k_sl=1.0, bins=5)
+    assert r["gaps"] == pytest.approx(r_ref["gaps"])
+    assert all(t.equals(r_ref["tables"][c]) for c, t in r["tables"].items())

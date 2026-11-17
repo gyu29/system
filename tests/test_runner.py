@@ -66,8 +66,8 @@ class Spy:
     def __init__(self, log: list):
         self.log = log
 
-    def fit(self, train, valid):
-        self.log.append(("fit", train, valid))
+    def fit(self, train, valid, *, full=None):
+        self.log.append(("fit", train, valid, full))
         return self
 
     def predict(self, df):
@@ -120,7 +120,7 @@ def test_fit_sees_only_the_purged_past():
         (d(2010, 1, 29), d(2005, 10, 31), d(2006, 12, 29), d(2008, 11, 28), 70),
         (d(2011, 1, 31), d(2006, 10, 31), d(2007, 12, 31), d(2009, 11, 30), 82),
     ]
-    for (_, train, valid), (test_start, train_end, valid_start, valid_end, n_train) in zip(fits, expected):
+    for (_, train, valid, full), (test_start, train_end, valid_start, valid_end, n_train) in zip(fits, expected):
         assert train["date"].min() == d(2000, 1, 31) and train["date"].max() == train_end
         assert valid["date"].min() == valid_start and valid["date"].max() == valid_end
         assert train["date"].n_unique() == n_train and valid["date"].n_unique() == 24
@@ -131,6 +131,15 @@ def test_fit_sees_only_the_purged_past():
         assert max(train["label_end_12m"].max(), valid["label_end_12m"].max()) < test_start
         # ... and every inner-train label was complete before inner validation starts
         assert train["label_end_12m"].max() < valid_start
+        # the refit frame: every labelled training date, the 13 purged months between train and valid
+        # included (n_train + 13 + 24 dates), still purged against the test block
+        assert full["date"].n_unique() == n_train + 13 + 24 and full.height == (n_train + 37) * 4
+        assert full["date"].min() == d(2000, 1, 31) and full["date"].max() == valid_end
+        assert full["label_end_12m"].max() < test_start and full["target"].null_count() == 0
+        assert full.columns == train.columns
+        gap = full.filter((pl.col("date") > train_end) & (pl.col("date") < valid_start))
+        assert gap["date"].n_unique() == 13
+        assert pl.concat([train, gap, valid]).sort("date", "security_id").equals(full.sort("date", "security_id"))
     # literal label ends for fold 2010: 2005-10 + 12m and 2008-11 + 12m
     assert fits[0][1]["label_end_12m"].max() == d(2006, 10, 31)
     assert fits[0][2]["label_end_12m"].max() == d(2009, 11, 30)
@@ -139,12 +148,13 @@ def test_fit_sees_only_the_purged_past():
 def test_fit_frames_keep_labels_and_have_no_null_targets():
     frame = without_label(without_label(panel(), 4, d(2004, 3, 31)), 3, d(2007, 6, 29))
     _, fits, _ = run(frame)
-    _, train, valid = fits[0]
+    _, train, valid, full = fits[0]
+    assert full.height == (70 + 13 + 24) * 4 - 2  # both unlabelled rows dropped from the refit frame too
     # one unlabelled row dropped from inner train (70 x 4 - 1) and one from inner valid (24 x 4 - 1)
     assert train.height == 279 and valid.height == 95
     assert train.filter((pl.col("security_id") == 4) & (pl.col("date") == d(2004, 3, 31))).is_empty()
     assert valid.filter((pl.col("security_id") == 3) & (pl.col("date") == d(2007, 6, 29))).is_empty()
-    for _, tr, va in fits:
+    for _, tr, va, _ in fits:
         assert tr["target"].null_count() == 0 and va["target"].null_count() == 0
         assert tr.columns == frame.columns and va.columns == frame.columns
 
@@ -249,7 +259,7 @@ def test_nothing_after_the_fold_end_is_touched():
     oof, fits, predicts = run(folds=folds)
     assert [f.name for f in folds] == ["2010"]
     assert oof["date"].max() == d(2010, 12, 31) and oof.height == 48
-    seen = pl.concat([fits[0][1]["date"], fits[0][2]["date"], predicts[0]["date"]])
+    seen = pl.concat([fits[0][1]["date"], fits[0][2]["date"], fits[0][3]["date"], predicts[0]["date"]])
     assert seen.max() == d(2010, 12, 31)
 
 
@@ -396,7 +406,7 @@ def test_fit_on_all_uses_inner_split_on_every_date():
     log: list = []
     model = fit_on_all(lambda: Spy(log), frame, RULES)
     assert isinstance(model, Spy) and len(log) == 1
-    _, train, valid = log[0]
+    _, train, valid, full = log[0]
     # inner valid = last 24 dates 2009-01 .. 2010-12 minus the unlabelled 2010 -> 2009 only (12 dates)
     assert valid["date"].min() == d(2009, 1, 30) and valid["date"].max() == d(2009, 12, 31)
     assert valid.height == 12 * 4 and valid["target"].null_count() == 0
@@ -404,6 +414,11 @@ def test_fit_on_all_uses_inner_split_on_every_date():
     assert train["date"].n_unique() == 95 and train["date"].max() == d(2007, 11, 30)
     assert train["label_end_12m"].max() < valid["date"].min()
     assert train.columns == frame.columns
+    # the final refit sees every labelled row, the 13 purged months 2007-12 .. 2008-12 included:
+    # 95 + 13 + 12 = 120 dates, 2000-01 .. 2009-12 (the purge only guards selection on inner valid)
+    assert full["date"].n_unique() == 120 and full.height == 120 * 4
+    assert full["date"].min() == d(2000, 1, 31) and full["date"].max() == d(2009, 12, 31)
+    assert full.equals(frame.filter(pl.col("target").is_not_null()))
 
 
 def test_fit_on_all_asserts_the_purge():

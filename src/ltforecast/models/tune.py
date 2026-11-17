@@ -112,3 +112,21 @@ def run(
 def best(table: pl.DataFrame, grid: Sequence[LGBMParams]) -> LGBMParams:
     """The winning LGBMParams of a `run` table (grid = the list passed to run)."""
     return grid[int(table.filter(pl.col("winner"))["trial"].item())]
+
+
+def choose(
+    t_obj: pl.DataFrame, objs: Sequence[LGBMParams], t_grid: pl.DataFrame, grid: Sequence[LGBMParams],
+) -> tuple[LGBMParams, str, pl.DataFrame]:
+    """The overall winner across the objective stage and the grid (plan 6.1: highest mean IC).
+
+    `grid(base)` never contains its base, so the objective-stage winner (already scored on the same
+    folds and counted as a trial) must stay in the comparison. The grid winner replaces it only if its
+    mean_ic is strictly higher (the earlier-evaluated config wins ties). Returns (params, stage, t_grid)
+    with stage "objective" or "grid"; when the objective winner is kept, the returned grid table's
+    `winner` column is all False so no grid row is reported as the shipped config.
+    """
+    obj_ic = float(t_obj.filter(pl.col("winner"))["mean_ic"].item())
+    grid_ic = float(t_grid.filter(pl.col("winner"))["mean_ic"].item())
+    if grid_ic > obj_ic:
+        return best(t_grid, grid), "grid", t_grid
+    return best(t_obj, objs), "objective", t_grid.with_columns(pl.lit(False).alias("winner"))

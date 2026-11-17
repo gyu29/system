@@ -16,7 +16,10 @@ from ltforecast.validation.splitter import Fold, assert_purged, inner_split
 class Model(Protocol):
     name: str
 
-    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None) -> Model: ...
+    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None, *, full: pl.DataFrame | None = None
+            ) -> Model: ...
+    # `full`: every labelled row of the training dates (train + the purged gap + valid). Selection
+    # (early stopping, alphas, weights) uses train/valid only; a refit uses `full` when given.
 
     def predict(self, df: pl.DataFrame) -> np.ndarray: ...  # one score per row, higher = better
 
@@ -47,8 +50,10 @@ def walk_forward(
     sorted by date, security_id.
 
     Per fold a fresh model is fit on (inner_train, inner_valid) from `inner_split`, both without
-    null-target rows; the purged months between the two are not passed to the model. `assert_purged`
-    is checked for train vs the first test date and for inner_train vs the first inner_valid date.
+    null-target rows, plus `full=` every labelled row of the fold's training dates (inner_train, the
+    purged months between the two, and inner_valid): selection uses train/valid, the refit uses `full`.
+    `assert_purged` is checked for all training rows vs the first test date and for inner_train vs the
+    first inner_valid date.
     Every test row is scored, labelled or not, from a frame with all label columns, `target` and
     `extra_label_cols` removed, so a model cannot read a test label. With one output `predict` returns
     shape (n,); with k outputs shape (n, k), column j going to `outputs[j]`.
@@ -69,8 +74,9 @@ def walk_forward(
         assert_purged(ends.filter(in_train), fold.test_dates[0], label_end_col, target=target)
 
         train_dates, valid_dates = inner_split(fold.train_dates, rules)
-        train = frame.filter(pl.col("date").is_in(list(train_dates)) & labelled)
-        valid = frame.filter(pl.col("date").is_in(list(valid_dates)) & labelled)
+        full = frame.filter(in_train & labelled)
+        train = full.filter(pl.col("date").is_in(list(train_dates)))
+        valid = full.filter(pl.col("date").is_in(list(valid_dates)))
         if train.is_empty() or valid.is_empty():
             raise ValueError(f"fold {fold.name}: no labelled rows to train or validate on")
         assert_purged(train, valid_dates[0], label_end_col, target=target)
@@ -79,7 +85,8 @@ def walk_forward(
         if test.is_empty():
             raise ValueError(f"fold {fold.name}: no rows on its test dates")
         model = make_model()
-        model.fit(train, valid)
+        model.fit(train, valid, full=full)
+        del full
         shown = test.drop(hidden)
         pred = _check_pred(
             np.asarray(model.predict(shown), dtype=np.float64), test.height, outputs, f"fold {fold.name}"
@@ -111,16 +118,18 @@ def fit_on_all(
 
     The distinct dates of `frame` are split by `inner_split` into (inner_train, inner_valid); both
     keep only labelled rows, and `assert_purged` checks that every inner-train label ended before
-    inner validation starts. The caller decides which rows `frame` holds (dev rows only before Phase 9).
+    inner validation starts. The model also gets `full=` every labelled row of `frame` (the purged
+    months between inner train and inner valid included) for its refit. The caller decides which rows `frame` holds (dev rows only before Phase 9).
     """
     dates = frame["date"].unique().sort().to_list()
     train_dates, valid_dates = inner_split(dates, rules)
     labelled = pl.col(target).is_not_null()
-    train = frame.filter(pl.col("date").is_in(list(train_dates)) & labelled)
-    valid = frame.filter(pl.col("date").is_in(list(valid_dates)) & labelled)
+    full = frame.filter(labelled)
+    train = full.filter(pl.col("date").is_in(list(train_dates)))
+    valid = full.filter(pl.col("date").is_in(list(valid_dates)))
     if train.is_empty() or valid.is_empty():
         raise ValueError("fit_on_all: no labelled rows to train or validate on")
     assert_purged(train, valid_dates[0], label_end_col, target=target)
     model = make_model()
-    model.fit(train, valid)
+    model.fit(train, valid, full=full)
     return model

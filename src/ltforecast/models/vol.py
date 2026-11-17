@@ -185,9 +185,11 @@ class VolModel:
         return np.hstack([z, self._dummies(df)])
 
     # -- Model protocol ------------------------------------------------------------------------
-    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None = None) -> VolModel:
+    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None = None, *, full: pl.DataFrame | None = None
+            ) -> VolModel:
         """Fit on `train`. With a `valid` frame holding finite targets, valid_r2_ is the train-only
-        out-of-sample R²; then, if params.refit, the model is re-estimated on train + valid."""
+        out-of-sample R²; then, if params.refit, the model is re-estimated on `full` (the runner's
+        refit frame) when given, else on train + valid."""
         p = self.params
         self._fit_core(train)
         if valid is not None and valid.height and p.target in valid.columns:
@@ -195,7 +197,7 @@ class VolModel:
             if np.isfinite(yv).any():
                 self.valid_r2_ = oos_r2(self.predict_log(valid), yv)
                 if p.refit:
-                    self._fit_core(pl.concat([train, valid], how="diagonal_relaxed"))
+                    self._fit_core(full if full is not None else pl.concat([train, valid], how="diagonal_relaxed"))
         return self
 
     def _fit_core(self, train: pl.DataFrame) -> None:

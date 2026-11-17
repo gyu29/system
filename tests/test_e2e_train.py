@@ -191,6 +191,8 @@ def test_nothing_fit_on_gap_or_holdout_rows(run):
     assert meta["trained_through"] == cfg.dates.dev_end.isoformat()
     assert meta["fit_date_max"] <= cfg.dates.dev_end.isoformat()
     assert meta["synthetic"] is True and meta["fast"] is True
+    # the out-of-sample numbers behind the TP/SL verdict travel with the shipped models
+    assert set(meta["exit_holdout"]) >= {"sharpe", "max_dd", "hold_sharpe", "hold_max_dd", "nw_tstat", "picks"}
     for side in final_dir(store).glob("*.pkl.json"):
         m = json.loads(side.read_text())
         assert m["trained_through"] == cfg.dates.dev_end.isoformat(), side.name
@@ -218,6 +220,8 @@ def test_train_report_lists_all_six_criteria(run):
     for c in rep["criteria"]:
         assert f"| {c['n']} | {c['title']} | **{c['status'].upper()}** |" in md
     assert "SYNTHETIC DATA" in md
+    assert "Verdict test" in md and "Shipped LightGBM config comes from the" in md
+    assert set(rep["exits"]["holdout"]) >= {"sharpe", "hold_sharpe", "nw_tstat", "picks"}
     beats = "YES" if rep["beats_b2"] else "NO"
     assert f"Does the ensemble beat B2 (factor composite)? {beats}." in md
     assert rep["recommendation"] == ("ship ensemble" if rep["beats_b2"] else "ship B2")
@@ -331,6 +335,34 @@ def test_fit_final_refuses_a_train_state_from_a_different_run(run):
         state_path.write_text(original)
 
 
+def test_a_failed_fit_final_leaves_the_previous_final_models_untouched(run, monkeypatch):
+    import ltforecast.models.vol as vol_mod
+
+    cfg, mcfg, store, _ = run
+    live = final_dir(store)
+    before = {p.name: p.read_bytes() for p in live.iterdir()}
+    meta = json.loads(before["metadata.json"])
+    assert meta["run_id"] and all(json.loads(before[n])["run_id"] == meta["run_id"]
+                                  for n in before if n.endswith(".pkl.json"))
+
+    def boom(*a, **kw):  # fails after ensemble.pkl has been written
+        raise RuntimeError("vol step failed")
+    monkeypatch.setattr(vol_mod, "vol_frame", boom)
+    with pytest.raises(RuntimeError, match="vol step failed"):
+        fit_final(store, cfg, mcfg, CATALOG)
+    assert {p.name: p.read_bytes() for p in live.iterdir()} == before
+    assert sorted(p.name for p in live.parent.iterdir() if p.name.startswith("final")) == ["final"]
+    assert load_final(live).meta["run_id"] == meta["run_id"]
+
+
+def test_fit_metadata_counts_the_rows_each_final_model_was_fit_on(run):
+    cfg, mcfg, store, outputs = run
+    side = json.loads((final_dir(store) / "ensemble.pkl.json").read_text())
+    calls = [c for c in outputs["calls"]["fit_on_all"] if c["phase"] == "fit-final" and c["target"] == "target"]
+    assert len(calls) == 1
+    assert side["fit_rows"] <= side["labelled_rows"] and side["fit_date_max"] == calls[0]["date_max"].isoformat()
+
+
 def test_score_of_a_subset_equals_the_full_score_filtered(run):
     cfg, _, store, _ = run
     models = load_final(final_dir(store))
@@ -346,3 +378,15 @@ def test_score_of_a_subset_equals_the_full_score_filtered(run):
     assert sub["rank_pct"].min() > 0.85  # still ranked against the whole universe (alone: 0.1 to 0.9)
     with pytest.raises(ValueError, match="cross-section"):  # one ticker alone is refused
         score(models, features.filter(pl.col("security_id") == top[0]), raw, prices, secs, dates=[day])
+
+
+def test_load_inputs_refuses_dev_labels_that_reach_into_the_holdout(run):
+    import dataclasses
+
+    cfg, mcfg, store, _ = run
+    load_inputs(store, cfg, mcfg, CATALOG)  # the shipped test dates leave room for every label window
+    # holdout moved up to two months after dev_end: the stored periods still agree (rows <= dev_end stay
+    # dev), but their 12-month label windows now end inside the holdout
+    near = dataclasses.replace(cfg, dates=dataclasses.replace(cfg.dates, holdout_start=dt.date(2014, 3, 1)))
+    with pytest.raises(ValueError, match="holdout_start 2014-03-01"):
+        load_inputs(store, near, mcfg, CATALOG)

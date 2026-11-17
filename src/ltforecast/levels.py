@@ -10,6 +10,11 @@ path after entry and record which level the close crosses first within the horiz
 - A delisting inside the window is a final day that opens and closes at
   last close * (1 + delisting return), so a -30% delisting gaps through most stops.
 - No crossing: exit at the close on the horizon day (or at the delisting value).
+- Stale (optional, `stale_days`): with no crossing, if the prices stop more than `stale_days` trading
+  days before the horizon day and the security has no delisting dated on or before that day, the exit
+  is unknown: outcome, exit_day, exit_date and exit_ret are null (labels.forward_returns' rule; the
+  same positions `exits.position_paths(stale_days=...)` marks stale). A crossing before the prices
+  stop is kept.
 """
 
 from __future__ import annotations
@@ -95,11 +100,14 @@ def barrier_labels(
     calendar: pl.Series,
     horizon: int,
     rules: BarrierRules,
+    stale_days: int | None = None,
 ) -> pl.DataFrame:
     """One row per (entry, k_tp, k_sl) for entries (security_id, date, sigma) with a complete window.
 
     Columns: security_id, date, sigma, k_tp, k_sl, tp_level, sl_level (returns from entry; null = no
     barrier), outcome (tp | sl | time), exit_day (trading days after entry), exit_date, exit_ret.
+    With `stale_days` (cfg.labels.stale_price_days) a no-crossing row whose prices stop early without a
+    delisting has outcome, exit_day, exit_date and exit_ret null (see the module docstring).
     """
     cal = calendar.to_frame("date").with_row_index("d")
     ent = (
@@ -110,7 +118,9 @@ def barrier_labels(
     )
     ent_by_sid = ent.partition_by("security_id", as_dict=True)
 
-    out: dict[str, list[np.ndarray]] = {k: [] for k in OUT_SCHEMA if k not in ("date", "exit_date")} | {"d": []}
+    out: dict[str, list[np.ndarray]] = (
+        {k: [] for k in OUT_SCHEMA if k not in ("date", "exit_date")} | {"d": [], "_early": []}
+    )
     for (sid,), g in _price_paths(prices, delist_rets, cal).partition_by("security_id", as_dict=True).items():
         e = ent_by_sid.get((sid,))
         if e is None:
@@ -133,6 +143,9 @@ def barrier_labels(
         valid = ~np.isnan(rc)
         last = horizon - 1 - valid[:, ::-1].argmax(axis=1)
         time_ret = np.where(valid.any(axis=1), rc[np.arange(m), last], np.nan)
+        # prices stop before horizon - stale_days (index h-1 is the horizon day); delistings checked below
+        early = (np.zeros(m, bool) if stale_days is None
+                 else ~valid.any(axis=1) | (last < horizon - 1 - stale_days))
 
         tp, sl = {}, {}
         for k in rules.k_tp:
@@ -156,6 +169,7 @@ def barrier_labels(
                 out["outcome"].append(np.where(is_tp, "tp", np.where(is_sl, "sl", "time")))
                 out["exit_day"].append(np.where(is_tp, tp_i, np.where(is_sl, sl_i, last)) + 1)
                 out["exit_ret"].append(np.where(is_tp, tp_fill, np.where(is_sl, sl_fill, time_ret)) - 1)
+                out["_early"].append(early & ~is_tp & ~is_sl)
 
     if not out["d"]:
         return pl.DataFrame(schema=OUT_SCHEMA)
@@ -166,10 +180,20 @@ def barrier_labels(
         pl.col("exit_day").cast(pl.Int64),
         pl.col("d").cast(pl.UInt32),
     )
-    return (
-        df.with_columns((pl.col("d") + pl.col("exit_day")).cast(pl.UInt32).alias("d_exit"))
+    df = (
+        df.with_columns(
+            (pl.col("d") + pl.col("exit_day")).cast(pl.UInt32).alias("d_exit"),
+            (pl.col("d") + horizon).cast(pl.UInt32).alias("d_end"),
+        )
         .join(cal, on="d")
         .join(cal.rename({"d": "d_exit", "date": "exit_date"}), on="d_exit")
-        .select(list(OUT_SCHEMA))
-        .sort("date", "security_id", "k_tp", "k_sl", nulls_last=True)
+        .join(cal.rename({"d": "d_end", "date": "label_end"}), on="d_end")
     )
+    if stale_days is not None:
+        first_delist = delist_rets.group_by("security_id").agg(pl.col("date").min().alias("_delist"))
+        delisted = (pl.col("_delist") <= pl.col("label_end")).fill_null(False)
+        stale = pl.col("_early") & ~delisted
+        df = df.join(first_delist, on="security_id", how="left").with_columns(
+            pl.when(~stale).then(pl.col(c)).alias(c) for c in ("outcome", "exit_day", "exit_date", "exit_ret")
+        )
+    return df.select(list(OUT_SCHEMA)).sort("date", "security_id", "k_tp", "k_sl", nulls_last=True)

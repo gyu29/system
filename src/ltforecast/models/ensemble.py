@@ -56,7 +56,9 @@ class TrainOnlyRidge(Ridge):
     """B3 for the weight-selection step: alpha chosen on valid exactly as `Ridge`, then fit on train
     ONLY, so its valid-set predictions are out of sample (plain `Ridge` refits on train + valid)."""
 
-    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None) -> TrainOnlyRidge:
+    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None, *, full: pl.DataFrame | None = None
+            ) -> TrainOnlyRidge:
+        """`full` is ignored: this member's predictions must stay out of sample on valid."""
         super().fit(train, valid)  # picks alpha_ (and valid_ic_)
         x, y = self._xy(train.select(*self.cols, self.target))
         if y.size == 0:
@@ -149,7 +151,10 @@ class Ensemble:
         dist = ((self.grid[tied] - 1.0 / k) ** 2).sum(axis=1)
         return self.grid[tied[np.argmin(dist)]], float(best)
 
-    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None) -> Ensemble:
+    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None, *, full: pl.DataFrame | None = None
+            ) -> Ensemble:
+        """Members selected on (train, valid) and weights chosen on valid; the final members are
+        refit on `full` when given (the runner's refit frame), else on train + valid."""
         k = len(self.names)
         equal = np.full(k, 1.0 / k)
         has_valid = valid is not None and not valid.is_empty()
@@ -179,10 +184,10 @@ class Ensemble:
             sel = selection.pop(nm, None)
             if sel is not None and hasattr(sel, "refit_from"):
                 # reuse the early-stopped member: refit on train + valid without a second ES pass
-                self.members_[nm] = sel.refit_from(train, valid)
+                self.members_[nm] = sel.refit_from(train, valid, full=full)
             else:
                 m = self.factories[nm](True)
-                m.fit(train, valid if has_valid else None)
+                m.fit(train, valid if has_valid else None, full=full)
                 self.members_[nm] = m
         return self
 

@@ -32,13 +32,57 @@ _FOLD = "_fold_pos"
 # isotonic probability ------------------------------------------------------------------------------
 
 
-class IsotonicCalibrator:
-    """Monotone map from a score in (0, 1) to P(outcome), clipped to [0, 1] inside and outside the
-    fitted range. Thin wrapper on sklearn `IsotonicRegression`; picklable."""
+def _score_bins(score: np.ndarray, y: np.ndarray, n_bins: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(mean score, mean y, row count) of about `n_bins` equal-count bins of `score`, in score order.
 
-    def __init__(self) -> None:
+    Rows with the same score always share a bin (bins are cut on whole tie groups, so the result does
+    not depend on row order). Every bin holds at least half the target n / n_bins rows: a light bin is
+    merged into the next one, and a light last bin into the one before it."""
+    uniq, inv = np.unique(score, return_inverse=True)
+    cnt = np.bincount(inv).astype(np.float64)
+    sum_y = np.bincount(inv, weights=y)
+    n = cnt.sum()
+    size = n / max(1, min(n_bins, int(n)))
+    end = np.cumsum(cnt)
+    raw = np.floor((end - 1.0) / size).astype(np.int64)  # bin of each tie group by its last row
+    _, raw = np.unique(raw, return_inverse=True)
+    b_cnt = np.bincount(raw, weights=cnt)
+    # merge light bins (loop over <= n_bins bins, not rows)
+    target = np.empty(b_cnt.size, dtype=np.int64)
+    out, acc = 0, 0.0
+    for i, c in enumerate(b_cnt):
+        target[i] = out
+        acc += c
+        if acc >= size / 2:
+            out, acc = out + 1, 0.0
+    if acc > 0 and out > 0:  # trailing light bin
+        target[target == out] = out - 1
+    grp = target[raw]
+    w = np.bincount(grp, weights=cnt)
+    return np.bincount(grp, weights=cnt * uniq) / w, np.bincount(grp, weights=sum_y) / w, w
+
+
+class IsotonicCalibrator:
+    """Monotone map from a score in (0, 1) to P(outcome); picklable.
+
+    Fitted as a count-weighted sklearn `IsotonicRegression` on about `n_bins` equal-count bins of the
+    score (tie groups never split), not on raw rows, so no isotonic block is smaller than about half of
+    n / n_bins rows: the extreme-ranked names cannot inherit a tiny pure-0 or pure-1 end block. Scores
+    outside the fitted range get the end bins' value (out_of_bounds="clip"). As a final guard every
+    prediction is clipped to [eps, 1 - eps]."""
+
+    n_bins: int = 50
+    eps: float = 0.01
+
+    def __init__(self, n_bins: int = 50, eps: float = 0.01) -> None:
+        if n_bins < 1:
+            raise ValueError(f"n_bins must be >= 1, got {n_bins}")
+        if not 0.0 <= eps < 0.5:
+            raise ValueError(f"eps must be in [0, 0.5), got {eps}")
         self._iso: IsotonicRegression | None = None
         self.n_obs = 0
+        self.n_bins = int(n_bins)
+        self.eps = float(eps)
 
     def fit(self, score: np.ndarray, y: np.ndarray) -> IsotonicCalibrator:
         score = np.asarray(score, dtype=np.float64)
@@ -47,14 +91,17 @@ class IsotonicCalibrator:
             raise ValueError(f"score and y must be equal-length non-empty 1-d arrays, got {score.shape}, {y.shape}")
         if not (np.isfinite(score).all() and np.isfinite(y).all()):
             raise ValueError("score and y must be finite")
-        self._iso = IsotonicRegression(y_min=0.0, y_max=1.0, increasing=True, out_of_bounds="clip").fit(score, y)
+        x_bin, y_bin, w_bin = _score_bins(score, y, self.n_bins)
+        self._iso = IsotonicRegression(y_min=0.0, y_max=1.0, increasing=True, out_of_bounds="clip").fit(
+            x_bin, y_bin, sample_weight=w_bin
+        )
         self.n_obs = int(score.size)
         return self
 
     def predict(self, score: np.ndarray) -> np.ndarray:
         if self._iso is None:
             raise RuntimeError("IsotonicCalibrator.predict called before fit")
-        return np.clip(self._iso.predict(np.asarray(score, dtype=np.float64)), 0.0, 1.0)
+        return np.clip(self._iso.predict(np.asarray(score, dtype=np.float64)), self.eps, 1.0 - self.eps)
 
 
 def score_pct(pred: str = "pred") -> pl.Expr:

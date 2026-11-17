@@ -493,7 +493,10 @@ class HitClassifier:
     def _ds(self, X, y, reference=None) -> lgb.Dataset:
         return lgb.Dataset(X, label=y, feature_name=self.cols, reference=reference, params={"verbose": -1})
 
-    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None) -> HitClassifier:
+    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None, *, full: pl.DataFrame | None = None
+            ) -> HitClassifier:
+        """Early stopping on valid; with params.refit the booster is refit for best_iteration rounds on
+        `full` (the runner's refit frame) when given, else on train + valid."""
         p, params = self.params, self._lgb_params()
         X, y = self._xy(train)
         if len(y) == 0:
@@ -511,8 +514,8 @@ class HitClassifier:
         )
         self.best_iteration = int(booster.best_iteration) or booster.current_iteration()
         if p.refit:
-            self.booster = lgb.train(params, self._ds(np.vstack([X, Xv]), np.concatenate([y, yv])),
-                                     num_boost_round=self.best_iteration)
+            Xa, ya = self._xy(full) if full is not None else (np.vstack([X, Xv]), np.concatenate([y, yv]))
+            self.booster = lgb.train(params, self._ds(Xa, ya), num_boost_round=self.best_iteration)
         else:
             self.booster = lgb.Booster(model_str=booster.model_to_string(num_iteration=self.best_iteration))
         return self

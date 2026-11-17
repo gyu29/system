@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -32,11 +32,14 @@ import polars as pl
 from ltforecast.config import BarrierRules
 from ltforecast.levels import _first_hit, _price_paths, level_ratio
 from ltforecast.validation.experiments import log_run, selection_guard
+from ltforecast.validation.metrics import newey_west_tstat
 
 TRADING_DAYS_PER_YEAR = 252
 SIGNAL_THRESHOLD = 0.40     # plan 6.5: sell when the model rank drops below the 40th percentile
 TOP_FRACTION = 0.20         # plan 6.5: buy the top quintile each month
 DEFAULT_K_TRAIL = (1.0, 1.5, 2.0)
+VERDICT_MIN_TSTAT = 2.0     # held-out daily (pair - hold) Newey-West t-stat needed for "exit_orders"
+VERDICT_NW_LAGS = 21        # about one month of daily lags
 _CHUNK = 20_000             # rows per block in the sleeve accumulation (bounds peak memory)
 
 Exit = tuple[np.ndarray, np.ndarray]
@@ -50,6 +53,9 @@ class Paths:
     plus `d` (calendar index of the entry date, Int64). Entries off the calendar or without a full
     h-day window inside the calendar are dropped (as in `levels.barrier_labels`).
     close, open: (n, h) total-return ratios vs the entry close, NaN where there is no price.
+    stale: (n,) bool or None. True = the prices stop early without a delisting inside the window
+    (the rule of `labels.forward_returns`), so the value at the horizon is unknown: the time / hold
+    exit of such a position has exit_ret NaN. Barrier hits before the prices stop stay known.
     """
 
     entries: pl.DataFrame
@@ -57,6 +63,7 @@ class Paths:
     open: np.ndarray
     horizon: int
     calendar: pl.Series
+    stale: np.ndarray | None = None
 
     def __len__(self) -> int:
         return self.close.shape[0]
@@ -74,6 +81,9 @@ class ExitSelection:
     variants: variant (hold | trailing | signal), param (k_trail, the signal threshold, null for
     hold), fold, sharpe, max_dd. Reported only; never selectable as the level pair.
     n_trials: configurations looked at (grid pairs + variants other than hold).
+    holdout: the out-of-sample numbers behind the verdict (see `holdout_verdict`): sharpe, max_dd
+    (mean over held-out folds of the pair picked on the other folds), hold_sharpe, hold_max_dd,
+    nw_tstat, n_days, picks.
     """
 
     k_tp: float | None
@@ -84,6 +94,7 @@ class ExitSelection:
     verdict: str
     variants: pl.DataFrame
     n_trials: int
+    holdout: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------------------------- paths
@@ -96,12 +107,17 @@ def position_paths(
     calendar: pl.Series,
     horizon: int,
     dtype: type = np.float32,
+    stale_days: int | None = None,
 ) -> Paths:
     """Paths for `entries` (security_id, date, any extra columns) from `prices` (security_id, date,
     open, close, adj_close) and `delist_rets` (security_id, date, delist_return).
 
     One flat NaN-padded array holds every security's dense daily path (first..last price day plus
     h + 1 padding days), so all windows are gathered in one fancy-index without a per-row loop.
+
+    `stale_days` (labels `stale_price_days`; None = off) sets `Paths.stale` as in
+    `labels.forward_returns`: no delisting dated on or before the horizon day, and the last price in
+    the window falls more than `stale_days` trading days before it (last index < h - 1 - stale_days).
     """
     if horizon < 1:
         raise ValueError(f"horizon must be >= 1, got {horizon}")
@@ -154,7 +170,28 @@ def position_paths(
         idx = b[:, None] + steps
         close[r] = flat_close[idx] / entry
         open_[r] = flat_open[idx] / entry
-    return Paths(entries=ent, close=close, open=open_, horizon=horizon, calendar=calendar)
+    stale = None if stale_days is None else _stale(ent, close, delist_rets, cal, horizon, stale_days)
+    return Paths(entries=ent, close=close, open=open_, horizon=horizon, calendar=calendar, stale=stale)
+
+
+def _stale(ent: pl.DataFrame, close: np.ndarray, delist_rets: pl.DataFrame, cal: pl.DataFrame, horizon: int,
+           stale_days: int) -> np.ndarray:
+    """Positions whose prices stop more than `stale_days` days before the horizon day without a
+    delisting dated on or before it (labels.forward_returns: delist_date <= label_end)."""
+    n, h = close.shape
+    valid = ~np.isnan(close)
+    last = h - 1 - valid[:, ::-1].argmax(axis=1)
+    early = ~valid.any(axis=1) | (last < h - 1 - stale_days)  # no price at all in the window: stale too
+    first_delist = delist_rets.group_by("security_id").agg(pl.col("date").min().alias("_delist"))
+    delisted = (
+        ent.select("security_id", (pl.col("d") + horizon).alias("_d_end"))
+        .join(cal.rename({"d": "_d_end", "date": "_label_end"}), on="_d_end", how="left", maintain_order="left")
+        .join(first_delist, on="security_id", how="left", maintain_order="left")
+        .select((pl.col("_delist") <= pl.col("_label_end")).fill_null(False))
+        .to_series()
+        .to_numpy()
+    )
+    return early & ~delisted
 
 
 # --------------------------------------------------------------------------------------------- exit rules
@@ -166,6 +203,14 @@ def _last_valid(close: np.ndarray) -> Exit:
     valid = ~np.isnan(close)
     last = h - 1 - valid[:, ::-1].argmax(axis=1)
     ret = np.where(valid.any(axis=1), close[np.arange(n), last].astype(np.float64), np.nan)
+    return last, ret
+
+
+def _time_exit(paths: Paths) -> Exit:
+    """`_last_valid` of the closes, with the value NaN (unknown) for stale positions (`Paths.stale`)."""
+    last, ret = _last_valid(paths.close)
+    if paths.stale is not None:
+        ret = np.where(paths.stale, np.nan, ret)
     return last, ret
 
 
@@ -188,15 +233,16 @@ def _levels(paths: Paths, ratio, side: str) -> Exit:
 
 
 def hold(paths: Paths) -> Exit:
-    """Plain hold: exit at the last close inside the window (the horizon day unless the data ends)."""
-    last, ret = _last_valid(paths.close)
+    """Plain hold: exit at the last close inside the window (the horizon day unless the data ends);
+    exit_ret NaN for a stale position."""
+    last, ret = _time_exit(paths)
     return (last + 1).astype(np.int64), ret - 1
 
 
 def fixed(paths: Paths, tp_ratio=None, sl_ratio=None) -> Exit:
     """Fixed take-profit / stop-loss at `tp_ratio` / `sl_ratio` x entry (scalars or (n,) arrays from
     `levels.level_ratio`; None = no barrier). Same outcomes as `levels.barrier_labels`."""
-    return _combine(_levels(paths, tp_ratio, "tp"), _levels(paths, sl_ratio, "sl"), _last_valid(paths.close))
+    return _combine(_levels(paths, tp_ratio, "tp"), _levels(paths, sl_ratio, "sl"), _time_exit(paths))
 
 
 def trailing(paths: Paths, trail_dist) -> Exit:
@@ -216,7 +262,7 @@ def trailing(paths: Paths, trail_dist) -> Exit:
     r, c = np.arange(n), np.minimum(idx, h - 1)
     o, s = paths.open[r, c].astype(np.float64), stop[r, c].astype(np.float64)
     fill = np.where(o <= s, o, s)
-    return _combine((np.full(n, h), np.full(n, np.nan)), (idx, fill), _last_valid(paths.close))
+    return _combine((np.full(n, h), np.full(n, np.nan)), (idx, fill), _time_exit(paths))
 
 
 def trail_distance(sigma: np.ndarray, k_trail: float, bounds: tuple[float, float]) -> np.ndarray:
@@ -374,13 +420,87 @@ def exit_entries(
 
 
 def _by_fold(days: np.ndarray, rets: np.ndarray, day_fold: dict[int, str], calendar: pl.Series, folds):
+    """{fold: (net Sharpe, max drawdown, daily returns (date, ret))} over the sleeves entered in each fold."""
     out = {}
     sleeve_fold = np.array([day_fold[int(x)] for x in days], dtype=object)  # one entry per month
     for f in folds:
         sel = sleeve_fold == f
-        r = _aggregate(days[sel], rets[sel], calendar)["ret"]
-        out[f] = (net_sharpe(r), max_drawdown(r))
+        r = _aggregate(days[sel], rets[sel], calendar)
+        out[f] = (net_sharpe(r), max_drawdown(r), r)
     return out
+
+
+def _pick(rows: list[dict]) -> dict | None:
+    """The selection rule on per-pair means (k_tp, k_sl, sharpe, max_dd; hold = None/None first or
+    anywhere): best mean Sharpe among non-hold pairs whose max_dd is no worse than hold's, or among
+    all non-hold pairs when none qualifies; first in grid order on ties. None without a non-hold pair."""
+    hold_dd = next(r["max_dd"] for r in rows if r["k_tp"] is None and r["k_sl"] is None)
+    cands = [r for r in rows if not (r["k_tp"] is None and r["k_sl"] is None)]
+    pool = [r for r in cands if r["max_dd"] >= hold_dd] or cands
+    return max(pool, key=lambda r: r["sharpe"]) if pool else None
+
+
+def holdout_verdict(
+    table: pl.DataFrame,
+    diffs: dict[tuple, np.ndarray],
+    *,
+    min_tstat: float = VERDICT_MIN_TSTAT,
+    lags: int = VERDICT_NW_LAGS,
+) -> tuple[str, dict]:
+    """Out-of-sample verdict on the TP/SL pairs (leave one fold out).
+
+    `table`: k_tp, k_sl, fold, sharpe, max_dd for every pair and fold (hold = null/null). `diffs`:
+    (k_tp, k_sl, fold) -> daily net return of that pair minus hold on that fold. For each fold f the
+    pair is chosen by `_pick` on the plain means over the OTHER folds; f then scores it. verdict =
+    "exit_orders" only when, over the held-out folds, the mean Sharpe of the picks beats hold's mean
+    Sharpe, their mean max drawdown is no worse than hold's, and the Newey-West t-stat (`lags`) of the
+    stitched held-out daily differences is >= `min_tstat`; else "risk_reference". With fewer than two
+    folds there is nothing held out: "risk_reference".
+    Returns (verdict, {"sharpe", "max_dd", "hold_sharpe", "hold_max_dd", "nw_tstat", "n_days",
+    "picks": [{"fold", "k_tp", "k_sl"}]}).
+    """
+    folds = list(dict.fromkeys(table["fold"].to_list()))
+    info: dict = {"sharpe": math.nan, "max_dd": math.nan, "hold_sharpe": math.nan, "hold_max_dd": math.nan,
+                  "nw_tstat": math.nan, "n_days": 0, "picks": []}
+    if len(folds) < 2:
+        return "risk_reference", info
+    keyed = {(r["k_tp"], r["k_sl"], r["fold"]): r for r in table.iter_rows(named=True)}
+    pairs = list(dict.fromkeys((r["k_tp"], r["k_sl"]) for r in table.iter_rows(named=True)))
+    picked_s, picked_dd, hold_s, hold_dd, stitched = [], [], [], [], []
+    for f in folds:
+        others = [g for g in folds if g != f]
+        means = [
+            {"k_tp": a, "k_sl": b,
+             "sharpe": float(np.mean([keyed[(a, b, g)]["sharpe"] for g in others])),
+             "max_dd": float(np.mean([keyed[(a, b, g)]["max_dd"] for g in others]))}
+            for a, b in pairs
+        ]
+        best = _pick(means)
+        if best is None:
+            return "risk_reference", info
+        a, b = best["k_tp"], best["k_sl"]
+        info["picks"].append({"fold": f, "k_tp": a, "k_sl": b})
+        picked_s.append(keyed[(a, b, f)]["sharpe"])
+        picked_dd.append(keyed[(a, b, f)]["max_dd"])
+        hold_s.append(keyed[(None, None, f)]["sharpe"])
+        hold_dd.append(keyed[(None, None, f)]["max_dd"])
+        stitched.append(np.asarray(diffs[(a, b, f)], dtype=np.float64))
+    dd = np.concatenate(stitched) if stitched else np.empty(0)
+    dd = dd[np.isfinite(dd)]
+    t = newey_west_tstat(dd, lags) if dd.size >= 2 else math.nan
+    info.update(sharpe=float(np.mean(picked_s)), max_dd=float(np.mean(picked_dd)), hold_sharpe=float(np.mean(hold_s)),
+                hold_max_dd=float(np.mean(hold_dd)), nw_tstat=float(t), n_days=int(dd.size))
+    beats = (info["sharpe"] > info["hold_sharpe"] and info["max_dd"] >= info["hold_max_dd"]
+             and math.isfinite(t) and t >= min_tstat)
+    return ("exit_orders" if beats else "risk_reference"), info
+
+
+def _diff(a: pl.DataFrame, b: pl.DataFrame) -> np.ndarray:
+    """Daily ret of `a` minus `b` on the dates both have, in date order."""
+    if a.height == b.height and a["date"].equals(b["date"]):  # same sleeves: the usual case, no join
+        return (a["ret"] - b["ret"]).to_numpy()
+    j = a.join(b, on="date", how="inner", suffix="_b").sort("date")
+    return (j["ret"] - j["ret_b"]).to_numpy()
 
 
 def select_pair(
@@ -392,17 +512,22 @@ def select_pair(
     signal_days: np.ndarray | None = None,
     signal_threshold: float = SIGNAL_THRESHOLD,
     exp_dir: str | Path | None = None,
+    verdict_min_tstat: float = VERDICT_MIN_TSTAT,
+    verdict_lags: int = VERDICT_NW_LAGS,
 ) -> ExitSelection:
     """Choose one global (k_tp, k_sl) pair on dev walk-forward folds (plan 6.5).
 
     `paths.entries` needs `fold` and `sigma` (from `exit_entries`); per fold, the portfolio holds the
-    positions entered on that fold's test dates. The pair with the best MEAN net Sharpe across folds
-    (`selection_guard`) is chosen among non-hold pairs whose mean max drawdown is no worse than hold's
-    (or among all non-hold pairs when none qualifies, as reference levels). verdict = "exit_orders"
-    when it beats hold on mean net Sharpe and is no worse on mean max drawdown, else
-    "risk_reference". Trailing stops (k_trail, distance from `trail_distance`) and the signal exit
-    (`signal_days`, from `signal_exit_days`) are evaluated and reported as variants only. With
-    `exp_dir` the trials are logged to the experiment log.
+    positions entered on that fold's test dates. Positions whose hold value is unknown (no entry
+    price, or `Paths.stale`) are left out of EVERY rule, so all rules are scored on the same
+    positions. The pair with the best MEAN net Sharpe across folds (`selection_guard`) is chosen
+    among non-hold pairs whose mean max drawdown is no worse than hold's (or among all non-hold pairs
+    when none qualifies, as reference levels). The verdict is judged out of sample by
+    `holdout_verdict` (leave one fold out, plus a Newey-West t-stat gate on the daily difference vs
+    hold), because the in-sample best of 24 noisy pairs beats hold almost always under the null.
+    Trailing stops (k_trail, distance from `trail_distance`) and the signal exit (`signal_days`, from
+    `signal_exit_days`) are evaluated and reported as variants only. With `exp_dir` the trials are
+    logged to the experiment log.
     """
     ent = paths.entries
     for c in ("fold", "sigma"):
@@ -413,10 +538,11 @@ def select_pair(
         raise ValueError("sigma must be finite for every position")
     folds = list(dict.fromkeys(ent["fold"].to_list()))
     day_fold = dict(zip(ent["d"].to_list(), ent["fold"].to_list()))
-    time = _last_valid(paths.close)
+    time = _time_exit(paths)
+    known = np.isfinite(time[1])  # the same positions under every rule
 
     def evaluate(exit_: Exit) -> dict:
-        days, rets = _sleeves(paths, None, exit_[0], exit_[1], cost)
+        days, rets = _sleeves(paths, known, exit_[0], exit_[1], cost)
         return _by_fold(days, rets, day_fold, paths.calendar, folds)
 
     tp = {k: _levels(paths, level_ratio(sigma, k, rules.tp_bounds, "tp"), "tp") for k in rules.k_tp}
@@ -425,10 +551,11 @@ def select_pair(
     none_tp, none_sl = _levels(paths, None, "tp"), _levels(paths, None, "sl")
     hold_res = evaluate(_combine(none_tp, none_sl, time))
 
-    rows = []
+    rows, diffs = [], {}
     for a, b in dict.fromkeys([(None, None), *pairs]):
         res = hold_res if (a, b) == (None, None) else evaluate(_combine(tp.get(a, none_tp), sl.get(b, none_sl), time))
-        rows += [{"k_tp": a, "k_sl": b, "fold": f, "sharpe": s, "max_dd": m} for f, (s, m) in res.items()]
+        rows += [{"k_tp": a, "k_sl": b, "fold": f, "sharpe": s, "max_dd": m} for f, (s, m, _) in res.items()]
+        diffs |= {(a, b, f): _diff(r, hold_res[f][2]) for f, (_, _, r) in res.items()}
     schema = {"k_tp": pl.Float64, "k_sl": pl.Float64, "fold": pl.String, "sharpe": pl.Float64, "max_dd": pl.Float64}
     table = pl.DataFrame(rows, schema=schema)
 
@@ -449,25 +576,23 @@ def select_pair(
                 "eligible": pl.Boolean},
     )
 
-    cands = [r for r in summary_rows if not (r["k_tp"] is None and r["k_sl"] is None)]
-    pool = [r for r in cands if r["eligible"]] or cands
-    if pool:
-        best = max(pool, key=lambda r: r["mean_sharpe"])  # first in grid order on ties
-        k_tp, k_sl = best["k_tp"], best["k_sl"]
-        beats = best["mean_sharpe"] > hold_sharpe and best["mean_max_dd"] >= hold_dd
+    best = _pick([{"k_tp": r["k_tp"], "k_sl": r["k_sl"], "sharpe": r["mean_sharpe"], "max_dd": r["mean_max_dd"]}
+                  for r in summary_rows])
+    k_tp, k_sl = (best["k_tp"], best["k_sl"]) if best is not None else (None, None)
+    if best is None:
+        verdict, holdout = "risk_reference", {}
     else:
-        k_tp = k_sl = None
-        beats = False
-    verdict = "exit_orders" if beats else "risk_reference"
+        verdict, holdout = holdout_verdict(table, diffs, min_tstat=verdict_min_tstat, lags=verdict_lags)
 
-    var_rows = [{"variant": "hold", "param": None, "fold": f, "sharpe": s, "max_dd": m} for f, (s, m) in hold_res.items()]
+    var_rows = [{"variant": "hold", "param": None, "fold": f, "sharpe": s, "max_dd": m} for f, (s, m, _) in hold_res.items()]
     for k in k_trail:
         res = evaluate(trailing(paths, trail_distance(sigma, k, rules.sl_bounds)))
-        var_rows += [{"variant": "trailing", "param": k, "fold": f, "sharpe": s, "max_dd": m} for f, (s, m) in res.items()]
+        var_rows += [{"variant": "trailing", "param": k, "fold": f, "sharpe": s, "max_dd": m} for f, (s, m, _) in res.items()]
     if signal_days is not None:
         res = evaluate(signal(paths, signal_days))
         var_rows += [
-            {"variant": "signal", "param": signal_threshold, "fold": f, "sharpe": s, "max_dd": m} for f, (s, m) in res.items()
+            {"variant": "signal", "param": signal_threshold, "fold": f, "sharpe": s, "max_dd": m}
+            for f, (s, m, _) in res.items()
         ]
     variants = pl.DataFrame(var_rows, schema={"variant": pl.String, "param": pl.Float64, "fold": pl.String,
                                               "sharpe": pl.Float64, "max_dd": pl.Float64})
@@ -475,15 +600,17 @@ def select_pair(
 
     sel = ExitSelection(
         k_tp=k_tp, k_sl=k_sl, table=table, summary=summary, hold={"sharpe": hold_sharpe, "max_dd": hold_dd},
-        verdict=verdict, variants=variants, n_trials=n_trials,
+        verdict=verdict, variants=variants, n_trials=n_trials, holdout=holdout,
     )
     if exp_dir is not None:
         log_run(
             exp_dir, "exit_pairs",
             {"k_tp": list(rules.k_tp), "k_sl": list(rules.k_sl), "tp_bounds": list(rules.tp_bounds),
              "sl_bounds": list(rules.sl_bounds), "k_trail": list(k_trail), "signal": signal_days is not None,
-             "signal_threshold": signal_threshold, "cost": cost, "horizon": paths.horizon},
-            {"k_tp": k_tp, "k_sl": k_sl, "verdict": verdict, "hold": sel.hold, "summary": summary.to_dicts()},
+             "signal_threshold": signal_threshold, "cost": cost, "horizon": paths.horizon,
+             "verdict_min_tstat": verdict_min_tstat, "verdict_lags": verdict_lags},
+            {"k_tp": k_tp, "k_sl": k_sl, "verdict": verdict, "hold": sel.hold, "summary": summary.to_dicts(),
+             "holdout": holdout},
             n_trials=n_trials,
         )
     return sel

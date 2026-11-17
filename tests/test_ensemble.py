@@ -45,8 +45,9 @@ class Stub:
     def __init__(self, col, log, refit):
         self.col, self.log, self.refit, self.name = col, log, refit, f"stub_{col}"
 
-    def fit(self, train, valid):
+    def fit(self, train, valid, *, full=None):
         self.log.append((self.col, self.refit, train.height, None if valid is None else valid.height))
+        self.full = full
         return self
 
     def predict(self, df):

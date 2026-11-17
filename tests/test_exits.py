@@ -324,3 +324,263 @@ def test_exit_entries_top_quintile():
 def test_trail_distance_bounds():
     s = np.array([0.01, 0.2, 2.0])
     np.testing.assert_allclose(exits.trail_distance(s, 1.0, (0.08, 0.40)), [0.08, 1 - SL, 0.40])
+
+
+# --------------------------------------------------------------------------------------------- stale paths
+
+
+def stale_inputs(h=10):
+    """Prices falling 1% a day from 100 with open = previous close. Last price day per sid:
+    1 -> CAL[5] (stale), 2 -> CAL[5] + delisting on CAL[6] (known), 3 -> CAL[7] (window index 6 =
+    h - 1 - 3: not stale), 4 -> CAL[6] (index 5: stale), 5 -> full path, 6 -> CAL[3] with a delisting
+    on CAL[15], after the horizon day CAL[10] (stale, as labels.forward_returns)."""
+    last = {1: 5, 2: 5, 3: 7, 4: 6, 5: h + 2, 6: 3}
+    rows = [(sid, CAL[i], 100 * 0.99 ** max(i - 1, 0), 100 * 0.99**i, 100 * 0.99**i)
+            for sid, n in last.items() for i in range(n + 1)]
+    prices = pl.DataFrame(rows, schema=["security_id", "date", "open", "close", "adj_close"], orient="row")
+    delist = pl.DataFrame({"security_id": [2, 6], "date": [CAL[6], CAL[15]], "delist_return": [-0.5, -0.2]})
+    entries = pl.DataFrame({"security_id": list(last), "date": [CAL[0]] * len(last), "sigma": [0.2] * len(last)})
+    return prices, entries, delist
+
+
+def stale_market(h=10):
+    return position_paths(*stale_inputs(h), CAL, h, dtype=np.float64, stale_days=3)
+
+
+def test_position_paths_marks_stale_like_forward_returns():
+    p = stale_market()
+    row = {sid: i for i, sid in enumerate(p.entries["security_id"])}
+    assert {sid for sid, i in row.items() if p.stale[i]} == {1, 4, 6}
+    # off by default
+    prices_off = position_paths(*crafted_market(), CAL, 5)
+    assert prices_off.stale is None
+
+
+def test_stale_time_and_hold_exits_are_unknown_but_earlier_hits_are_kept():
+    p = stale_market()
+    row = {sid: i for i, sid in enumerate(p.entries["security_id"])}
+    day, ret = hold(p)
+    assert np.isnan(ret[row[1]]) and np.isnan(ret[row[4]]) and np.isnan(ret[row[6]])
+    # delisted inside the window: the appended delisting day is the exit (day 6), value 0.99^5 * 0.5
+    assert day[row[2]] == 6 and ret[row[2]] == pytest.approx(0.99**5 * 0.5 - 1)
+    assert ret[row[3]] == pytest.approx(0.99**7 - 1) and ret[row[5]] == pytest.approx(0.99**10 - 1)
+    # SL far away (0.80): never hit, so the stale positions have no known outcome
+    day, ret = fixed(p, None, 0.80)
+    assert np.isnan(ret[[row[1], row[4], row[6]]]).all() and np.isfinite(ret[[row[2], row[3], row[5]]]).all()
+    # SL at 0.97: the close 0.99^4 = 0.9606 on day 4 crosses it; the open 0.99^3 = 0.9703 did not gap,
+    # so the fill is the level. The stale sid 1 keeps this known 'sl' exit.
+    day, ret = fixed(p, None, 0.97)
+    assert day[row[1]] == 4 and ret[row[1]] == pytest.approx(-0.03)
+    assert day[row[6]] == 3 and np.isnan(ret[row[6]])  # sid 6's last price is day 3, before the stop
+    tday, tret = trailing(p, np.full(len(p), 0.5))
+    assert np.isnan(tret[row[1]]) and np.isfinite(tret[row[5]])
+
+
+def test_select_pair_leaves_stale_positions_out():
+    spike = [1.05, 1.25, 1.00, 0.80, 0.70]
+    dip = [0.80, 1.00, 1.25, 1.00, 0.90]
+    p = fold_paths([spike, dip])
+    rng = np.random.default_rng(0)
+    stale = rng.random(len(p)) < 0.3
+    stale[::4] = False  # every sleeve keeps a position
+    junk = p.close.copy()
+    junk[stale, 2:] = np.nan  # prices stop early: no TP hit inside, so these would be time exits
+    with_stale = Paths(entries=p.entries, close=junk, open=junk.copy(), horizon=p.horizon, calendar=CAL, stale=stale)
+    keep = np.flatnonzero(~stale)
+    without = Paths(entries=p.entries[keep], close=junk[keep], open=junk[keep].copy(), horizon=p.horizon, calendar=CAL)
+    a = select_pair(with_stale, SMALL, cost=0.002, k_trail=())
+    b = select_pair(without, SMALL, cost=0.002, k_trail=())
+    assert a.table.equals(b.table) and a.verdict == b.verdict
+    # without the mask, the stale rows are cashed out at their last print and the table changes
+    c = select_pair(Paths(entries=p.entries, close=junk, open=junk.copy(), horizon=p.horizon, calendar=CAL),
+                    SMALL, cost=0.002, k_trail=())
+    assert not c.table.equals(a.table)
+
+
+# --------------------------------------------------------------------------------------------- verdict and pick
+
+
+def test_pick_drawdown_eligibility_and_fallback():
+    hold_ = {"k_tp": None, "k_sl": None, "sharpe": 1.0, "max_dd": -0.10}
+    deep = {"k_tp": 1.0, "k_sl": None, "sharpe": 2.0, "max_dd": -0.20}     # best Sharpe, worse drawdown
+    shallow = {"k_tp": None, "k_sl": 1.0, "sharpe": 1.5, "max_dd": -0.05}
+    assert exits._pick([hold_, deep, shallow]) is shallow
+    assert exits._pick([hold_, deep]) is deep              # no eligible pair: fall back to all non-hold
+    assert exits._pick([hold_]) is None
+
+
+def verdict_table(sharpe: dict, dd: dict, folds=("f0", "f1", "f2")) -> pl.DataFrame:
+    """Rows (k_tp, k_sl, fold, sharpe, max_dd) from {pair: [per-fold sharpe]} and {pair: [per-fold max_dd]}."""
+    rows = [{"k_tp": a, "k_sl": b, "fold": f, "sharpe": sharpe[(a, b)][i], "max_dd": dd[(a, b)][i]}
+            for (a, b) in sharpe for i, f in enumerate(folds)]
+    return pl.DataFrame(rows, schema={"k_tp": pl.Float64, "k_sl": pl.Float64, "fold": pl.String,
+                                      "sharpe": pl.Float64, "max_dd": pl.Float64})
+
+
+def noisy_diffs(pairs, folds=("f0", "f1", "f2"), mean=0.001, n=200, seed=0):
+    rng = np.random.default_rng(seed)
+    return {(a, b, f): mean + rng.normal(0, 0.001, n) for (a, b) in pairs for f in folds}
+
+
+H0, A_, B_ = (None, None), (1.0, None), (None, 1.0)
+
+
+def test_holdout_verdict_leave_one_fold_out_overturns_in_sample_winner():
+    # in sample A has the best mean Sharpe (1.833 vs B 1.5 vs hold 1.0): the old rule said exit_orders.
+    # Leave f0 out: A (3 - 0.5)/2 = 1.25 < B 1.5 -> B scores 1.5 on f0; same for f1;
+    # leave f2 out: A 3.0 -> A scores -0.5 on f2. Held-out mean (1.5 + 1.5 - 0.5)/3 = 0.833 < 1.0.
+    sh = {H0: [1.0, 1.0, 1.0], A_: [3.0, 3.0, -0.5], B_: [1.5, 1.5, 1.5]}
+    dd = {H0: [-0.1] * 3, A_: [-0.05] * 3, B_: [-0.05] * 3}
+    v, info = exits.holdout_verdict(verdict_table(sh, dd), noisy_diffs(sh))
+    assert v == "risk_reference"
+    assert [(p["fold"], p["k_tp"], p["k_sl"]) for p in info["picks"]] == [
+        ("f0", None, 1.0), ("f1", None, 1.0), ("f2", 1.0, None)]
+    assert info["sharpe"] == pytest.approx(2.5 / 3) and info["hold_sharpe"] == pytest.approx(1.0)
+    assert info["max_dd"] == pytest.approx(-0.05) and info["n_days"] == 600
+
+
+def test_holdout_verdict_needs_sharpe_drawdown_and_significance():
+    sh = {H0: [1.0, 1.0, 1.0], B_: [1.5, 1.5, 1.5]}
+    good_dd = {H0: [-0.1] * 3, B_: [-0.05] * 3}
+    v, info = exits.holdout_verdict(verdict_table(sh, good_dd), noisy_diffs(sh))
+    assert v == "exit_orders" and info["nw_tstat"] >= 2 and info["sharpe"] == pytest.approx(1.5)
+    # B is the only non-hold pair, so it is picked although its drawdown is worse than hold's:
+    # the verdict's own drawdown clause must say risk_reference
+    bad_dd = {H0: [-0.1] * 3, B_: [-0.2] * 3}
+    v, info = exits.holdout_verdict(verdict_table(sh, bad_dd), noisy_diffs(sh))
+    assert v == "risk_reference" and info["max_dd"] == pytest.approx(-0.2) and info["nw_tstat"] >= 2
+    # better Sharpe and drawdown but the daily difference is noise: t < 2
+    v, info = exits.holdout_verdict(verdict_table(sh, good_dd), noisy_diffs(sh, mean=0.0, seed=3))
+    assert v == "risk_reference" and abs(info["nw_tstat"]) < 2
+    # one fold: nothing held out
+    one = verdict_table({H0: [1.0], B_: [2.0]}, {H0: [-0.1], B_: [-0.05]}, folds=("f0",))
+    v, info = exits.holdout_verdict(one, noisy_diffs(sh, folds=("f0",)))
+    assert v == "risk_reference" and info["picks"] == []
+
+
+def test_select_pair_summary_eligible_flag():
+    up = [0.80, 0.95, 1.05, 1.10, 1.15]
+    slow = [0.99, 1.02, 1.04, 1.06, 1.12]
+    sel = select_pair(fold_paths([up, slow]), SMALL, cost=0.002, k_trail=())
+    s = sel.summary
+    assert s["eligible"].to_list() == (s["mean_max_dd"] >= sel.hold["max_dd"]).to_list()
+    # SL-only sells the 0.80 dip: deeper drawdown than hold, so not eligible
+    row = s.filter(pl.col("k_tp").is_null() & (pl.col("k_sl") == 1.0)).row(0, named=True)
+    assert row["mean_max_dd"] < sel.hold["max_dd"] and row["eligible"] is False
+
+
+def test_select_pair_scores_each_fold_on_its_own_positions():
+    spike = [1.05, 1.25, 1.00, 0.80, 0.70]
+    dip = [0.80, 1.00, 1.25, 1.00, 0.90]
+    up = [1.01, 1.03, 1.02, 1.06, 1.08]
+    kinds = {"f0": spike, "f1": dip, "f2": up}
+    close, d0, fold = [], [], []
+    for i, (f, base) in enumerate(kinds.items()):
+        for s in range(2):
+            for j in range(4):
+                close.append(1 + (np.asarray(base) - 1) * (1 + 0.05 * j + 0.02 * s))
+                d0.append(10 * (2 * i + s))
+                fold.append(f)
+    p = mk_paths(np.array(close), d0=d0, extra={"fold": fold, "sigma": np.full(len(close), 0.2)})
+    sel = select_pair(p, SMALL, cost=0.002, k_trail=())
+    sigma = p.entries["sigma"].to_numpy()
+    rules = {(None, None): hold(p), (1.0, None): fixed(p, level_ratio(sigma, 1.0, SMALL.tp_bounds, "tp"), None),
+             (None, 1.0): fixed(p, None, level_ratio(sigma, 1.0, SMALL.sl_bounds, "sl"))}
+    fold_arr = np.array(fold)
+    for (a, b), (day, ret) in rules.items():
+        for f in kinds:
+            r = portfolio_returns(fold_arr == f, p, day, ret, 0.002)
+            f_a = pl.col("k_tp").is_null() if a is None else pl.col("k_tp") == a
+            f_b = pl.col("k_sl").is_null() if b is None else pl.col("k_sl") == b
+            row = sel.table.filter(f_a, f_b, pl.col("fold") == f).row(0, named=True)
+            assert row["sharpe"] == pytest.approx(net_sharpe(r)), (a, b, f)
+            assert row["max_dd"] == pytest.approx(max_drawdown(r)), (a, b, f)
+    hold_dd = sel.table.filter(pl.col("k_tp").is_null() & pl.col("k_sl").is_null())["max_dd"]
+    assert hold_dd.n_unique() == 3  # the folds really differ
+
+
+# --------------------------------------------------------------------------------------------- null regression
+
+NULL_H, NULL_FOLDS, NULL_SLEEVES, NULL_PER = 42, 4, 6, 12
+NULL_CAL = pl.Series("date", [d(2000, 1, 3) + dt.timedelta(days=i)
+                              for i in range(21 * NULL_SLEEVES * NULL_FOLDS + NULL_H + 5)])
+
+
+def martingale_paths(seed: int, bad_drift: float = 0.0) -> Paths:
+    """4 folds x 6 monthly sleeves x 12 names; t(4) shocks, a common market factor and an Ito
+    correction so every price is a martingale: no exit rule can beat holding in expectation.
+    bad_drift < 0 (positive control): half the names fall at that annual log drift from day 6 on,
+    which a stop-loss cuts short."""
+    rng = np.random.default_rng(seed)
+    ds = np.repeat(21 * np.arange(NULL_FOLDS * NULL_SLEEVES), NULL_PER)
+    n, h = len(ds), NULL_H
+    sig = rng.uniform(0.2, 0.5, n)
+    lr = rng.standard_t(4, size=(n, h)) / np.sqrt(2) * (sig / np.sqrt(252))[:, None]
+    lr += (rng.standard_normal(len(NULL_CAL)) * 0.01)[ds[:, None] + np.arange(1, h + 1)[None, :]]
+    lr -= (0.5 * sig**2 / 252)[:, None] + 0.5 * 0.01**2
+    if bad_drift:
+        lr[rng.random(n) < 0.5, 5:] += bad_drift / 252
+    close = np.exp(np.cumsum(lr, axis=1))
+    ent = pl.DataFrame({"security_id": np.arange(n) % NULL_PER, "date": NULL_CAL.gather(ds), "d": ds.astype(np.int64),
+                        "fold": [f"f{x // (21 * NULL_SLEEVES)}" for x in ds], "sigma": sig})
+    return Paths(entries=ent, close=close, open=close.copy(), horizon=h, calendar=NULL_CAL)
+
+
+def test_verdict_under_the_null_is_mostly_risk_reference():
+    # the old in-sample rule (best of 24 pairs vs hold on the same folds) said exit_orders in ~85%
+    verdicts = [select_pair(martingale_paths(s), GRID, cost=0.002, k_trail=()).verdict for s in range(20)]
+    assert verdicts.count("risk_reference") >= 16, verdicts
+
+
+def test_verdict_positive_control_real_stop_benefit():
+    for s in range(3):
+        sel = select_pair(martingale_paths(100 + s, bad_drift=-3.0), GRID, cost=0.002, k_trail=())
+        assert sel.verdict == "exit_orders" and sel.k_sl is not None
+        assert sel.holdout["nw_tstat"] >= 2 and len(sel.holdout["picks"]) == 4
+
+
+def test_barrier_labels_null_the_same_stale_positions_as_position_paths():
+    h = 10
+    prices, entries, delist = stale_inputs(h)
+    p = stale_market(h)
+    stale = {sid for sid, flag in zip(p.entries["security_id"], p.stale) if flag}
+    # no TP; SL either absent or at exactly -3% (tiny k, lower bound 0.03)
+    rules = BarrierRules(horizon="10d", k_tp=(None,), k_sl=(None, 1e-6), tp_bounds=(0.10, 1.00),
+                         sl_bounds=(0.03, 0.40), sigma_window=252, sigma_min_obs=126)
+    lab = barrier_labels(prices, entries, delist, CAL, h, rules, stale_days=3)
+    no_sl = lab.filter(pl.col("k_sl").is_null())
+    nulls = no_sl.filter(pl.col("outcome").is_null())
+    assert set(nulls["security_id"]) == stale == {1, 4, 6}
+    assert nulls.select(pl.col("exit_day", "exit_date", "exit_ret").is_null().all()).row(0) == (True, True, True)
+    known = no_sl.filter(pl.col("outcome").is_not_null()).sort("security_id")
+    assert known["outcome"].to_list() == ["time"] * 3 and known["security_id"].to_list() == [2, 3, 5]
+    # sl at 0.97: sid 1 crosses on day 4 (window index 3) before its prices stop, so the hit is kept;
+    # sid 6's prices stop at day 3 above the stop, so it stays unknown; sid 4 hits on day 4 as well
+    sl = lab.filter(pl.col("k_sl").is_not_null()).sort("security_id")
+    out = dict(zip(sl["security_id"], zip(sl["outcome"], sl["exit_day"])))
+    assert out[1] == ("sl", 4) and out[4] == ("sl", 4) and out[6] == (None, None)
+    # matches fixed() on the same stale-marked paths, null <-> NaN
+    sigma = p.entries["sigma"].to_numpy()
+    _, ret = fixed(p, None, level_ratio(sigma, 1e-6, rules.sl_bounds, "sl"))
+    ref = p.entries.select("security_id", "date").join(sl, on=["security_id", "date"], how="left",
+                                                     maintain_order="left")
+    np.testing.assert_allclose(ret, ref["exit_ret"].fill_null(np.nan).to_numpy(), rtol=1e-12, equal_nan=True)
+    # off by default: every row has an outcome
+    assert barrier_labels(prices, entries, delist, CAL, h, rules)["outcome"].null_count() == 0
+
+
+def test_a_window_without_any_price_is_stale_in_levels_and_exits_alike():
+    # sid 1 trades only on the entry day CAL[0]; sid 2 the same but delists on CAL[3]; sid 3 trades daily
+    h = 10
+    rows = [(1, CAL[0], 100.0, 100.0, 100.0), (2, CAL[0], 100.0, 100.0, 100.0)]
+    rows += [(3, CAL[i], 100.0, 100.0, 100.0) for i in range(h + 1)]
+    prices = pl.DataFrame(rows, schema=["security_id", "date", "open", "close", "adj_close"], orient="row")
+    delist = pl.DataFrame({"security_id": [2], "date": [CAL[3]], "delist_return": [-0.4]})
+    entries = pl.DataFrame({"security_id": [1, 2, 3], "date": [CAL[0]] * 3, "sigma": [0.2] * 3})
+    p = position_paths(prices, entries, delist, CAL, h, dtype=np.float64, stale_days=3)
+    assert dict(zip(p.entries["security_id"], p.stale.tolist())) == {1: True, 2: False, 3: False}
+    rules = BarrierRules(horizon="10d", k_tp=(None,), k_sl=(None,), tp_bounds=(0.10, 1.00),
+                         sl_bounds=(0.08, 0.40), sigma_window=252, sigma_min_obs=126)
+    lab = barrier_labels(prices, entries, delist, CAL, h, rules, stale_days=3).sort("security_id")
+    assert lab["outcome"].to_list() == [None, "time", "time"]
+    assert lab["exit_ret"].to_list()[1:] == pytest.approx([-0.4, 0.0])

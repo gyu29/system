@@ -19,7 +19,7 @@ class Linear:
         self.cols = cols
         self.model = Ridge(alpha=1.0)
 
-    def fit(self, train, valid):
+    def fit(self, train, valid, *, full=None):
         self.model.fit(train.select(self.cols).to_numpy(), train["target"].to_numpy())
         return self
 

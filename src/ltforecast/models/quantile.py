@@ -122,7 +122,10 @@ class QuantileModel:
         df = df.filter(y.is_not_null() & y.is_finite())
         return self._x(df), df[self.target].cast(pl.Float64).to_numpy()
 
-    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None) -> QuantileModel:
+    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None, *, full: pl.DataFrame | None = None
+            ) -> QuantileModel:
+        """Early stopping per alpha on valid; with params.refit the booster is refit for those rounds on
+        `full` (the runner's refit frame) when given, else on train + valid."""
         x, y = self._xy(train)
         if len(y) == 0:
             raise ValueError(f"{self.name}: no labelled training rows")
@@ -130,6 +133,9 @@ class QuantileModel:
         has_valid = yv is not None and len(yv) > 0
         p = self.params
         self.boosters, self.best_iterations, self.valid_pinball = [], [], {}
+        xa = ya = None
+        if has_valid and p.refit:
+            xa, ya = self._xy(full) if full is not None else (np.vstack([x, xv]), np.concatenate([y, yv]))
         for alpha in self.alphas:
             params = self._lgb_params(alpha)
             if not has_valid:
@@ -149,7 +155,6 @@ class QuantileModel:
                 rounds = max(1, int(booster.best_iteration or booster.current_iteration()))
                 self.valid_pinball[alpha] = pinball_loss(yv, booster.predict(xv, num_iteration=rounds), alpha)
                 if p.refit:
-                    xa, ya = np.vstack([x, xv]), np.concatenate([y, yv])
                     booster = lgb.train(params, lgb.Dataset(xa, ya, free_raw_data=False), num_boost_round=rounds)
                 # without refit the early-stopped booster is kept and predicts with `rounds`
             self.boosters.append(booster)

@@ -3,7 +3,9 @@ the step-9 evaluation and its markdown report. The full run is in test_e2e_train
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -17,14 +19,18 @@ from ltforecast.modelconfig import load_model_config
 from ltforecast.pipeline import (
     SCORE_COLS,
     FinalModels,
+    FINAL_FILES,
     _need_folds,
+    check_labels_before_holdout,
     check_train_state,
     data_fingerprint,
     effective_config_hash,
     horizon_months,
     spread_deflated_sharpe,
     evaluate_forecast,
+    fit_all_recorded,
     level_ratios,
+    load_final,
     rank_pct,
     report_markdown,
     score,
@@ -219,6 +225,104 @@ def test_fit_final_refuses_a_train_state_from_another_config_or_run():
         check_train_state({"fast": True}, fast, dt.date(2013, 12, 31))  # an old train_state.json
 
 
+def _weekdays(start: dt.date, n: int) -> pl.Series:
+    days = pl.date_range(start, start + dt.timedelta(days=3 * n), "1d", eager=True)
+    return days.filter(days.dt.weekday() <= 5).head(n).alias("date")
+
+
+def test_dev_label_windows_must_end_before_the_holdout():
+    # calendar Mon 2021-10-25 .. Fri 2021-11-05; last dev date Fri 10-29 (index 4); +3 trading days = Wed 11-03
+    cal = _weekdays(dt.date(2021, 10, 25), 10)
+    assert cal[4] == dt.date(2021, 10, 29) and cal[7] == dt.date(2021, 11, 3) and cal[-1] == dt.date(2021, 11, 5)
+    frame = pl.DataFrame({"date": [dt.date(2021, 10, 28), dt.date(2021, 10, 29)], "security_id": [1, 1],
+                          "target": [0.5, None], "label_end_12m": [dt.date(2021, 11, 2), None]})
+    check_labels_before_holdout(frame, cal, 3, dt.date(2021, 11, 4))  # one trading day of margin
+    with pytest.raises(ValueError, match="2021-10-29"):  # window of the last dev date reaches the holdout
+        check_labels_before_holdout(frame, cal, 3, dt.date(2021, 11, 3))
+    # a stored label end inside the holdout is caught even if the calendar step says otherwise
+    late = frame.with_columns(pl.Series("label_end_12m", [dt.date(2021, 11, 8), None]))
+    with pytest.raises(ValueError, match="label_end_12m"):
+        check_labels_before_holdout(late, cal, 3, dt.date(2021, 11, 4))
+    # a window running off the calendar is safe only if no holdout price exists yet
+    check_labels_before_holdout(frame, cal, 20, dt.date(2021, 11, 8))
+    with pytest.raises(ValueError, match="holdout"):
+        check_labels_before_holdout(frame, cal, 20, dt.date(2021, 11, 5))
+
+
+class _SpyModel:
+    """Records the rows its fit received (train + valid, or `full` when the runner passes one)."""
+
+    name = "spy"
+
+    def fit(self, train, valid, *, full=None):
+        parts = [full] if full is not None else [train, valid]
+        self.seen = pl.concat([p.select("date", "security_id") for p in parts])
+        return self
+
+    def predict(self, df):
+        return np.zeros(df.height)
+
+
+def test_final_fit_metadata_describes_the_rows_actually_fitted():
+    # 30 month ends x 2 stocks, all labelled; inner split: valid = last 4 dates, train = first 30-4-3-1 = 22
+    dates = pl.date_range(dt.date(2000, 1, 1), dt.date(2002, 6, 1), "1mo", eager=True).dt.month_end()
+    frame = pl.DataFrame({"date": np.repeat(dates.to_numpy(), 2), "security_id": [1, 2] * 30}).with_columns(
+        pl.col("date").cast(pl.Date), pl.lit(0.5).alias("target"),
+        (pl.col("date").cast(pl.Date) + pl.duration(days=60)).alias("label_end_12m"))
+    rules = load_model_config().validation
+    rules = dataclasses.replace(rules, purge_months=3, embargo_months=1, inner_valid_months=4)
+    model, meta = fit_all_recorded(_SpyModel, frame, rules)
+    assert isinstance(model, _SpyModel)  # the recorder is unwrapped before the model is saved
+    assert meta["fit_rows"] == model.seen.height
+    assert meta["fit_date_min"] == model.seen["date"].min() and meta["fit_date_max"] == model.seen["date"].max()
+    assert meta["labelled_rows"] == 60
+    # the runner refits on `full`: the 4 purge/embargo months (2001-11 .. 2002-02) between inner train
+    # and inner valid are fitted too, so all 60 labelled rows reach the final model
+    assert meta["fit_rows"] == 60 and meta["fit_dates"] == 30
+    assert meta["fit_dates"] == model.seen["date"].n_unique()
+
+
+def _write_final(path, run_id="r1", through="2013-12-31", cols=("a", "b")):
+    from ltforecast.models.io import save_model
+
+    for name in FINAL_FILES:
+        save_model({"name": name}, path / f"{name}.pkl", {"run_id": run_id, "trained_through": through,
+                                                          "columns": list(cols)})
+    meta = {"run_id": run_id, "trained_through": through, "feature_columns": list(cols), "k_tp": 1.0,
+            "k_sl": 0.5, "verdict": "x", "hit_method": "mc", "market_return": 0.0, "conformal_offset": 0.0,
+            "conformal_ok": True, "barriers": {"horizon": "12m", "tp_bounds": [0.1, 1.0], "sl_bounds": [0.08, 0.4]}}
+    (path / "metadata.json").write_text(json.dumps(meta))
+
+
+def test_load_final_refuses_artifacts_from_different_runs(tmp_path):
+    from ltforecast.models.io import save_model
+
+    _write_final(tmp_path)
+    assert load_final(tmp_path).ensemble == {"name": "ensemble"}
+    # a later refit that died after writing ensemble.pkl
+    save_model({"name": "new"}, tmp_path / "ensemble.pkl", {"run_id": "r2", "trained_through": "2013-12-31",
+                                                             "columns": ["a", "b"]})
+    with pytest.raises(ValueError, match="ensemble"):
+        load_final(tmp_path)
+    for kw in ({"through": "2011-12-31"}, {"cols": ("x", "y")}):
+        bad = tmp_path / str(len(kw.get("cols", ())))
+        bad.mkdir()
+        _write_final(bad)
+        ref = json.loads((bad / "metadata.json").read_text())
+        _write_final(bad, **kw)
+        (bad / "metadata.json").write_text(json.dumps(ref))
+        with pytest.raises(ValueError, match="does not match"):
+            load_final(bad)
+    old = tmp_path / "old"
+    old.mkdir()
+    _write_final(old)
+    meta = json.loads((old / "metadata.json").read_text())
+    del meta["run_id"]
+    (old / "metadata.json").write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="run_id"):  # written before run ids: not trusted
+        load_final(old)
+
+
 def test_data_fingerprint_is_per_date_and_order_free():
     d1, d2 = dt.date(2020, 1, 31), dt.date(2020, 2, 28)
     df = pl.DataFrame({"date": [d1, d1, d2], "security_id": [1, 2, 1], "x": [0.1, 0.2, 0.3]})
@@ -260,6 +364,8 @@ def eval_inputs(gain: float, seed: int = 0):
     b2 = df.select("date", "security_id", "fold", pl.Series("pred", rng.normal(size=n)))
     sel = SimpleNamespace(
         k_tp=1.0, k_sl=0.5, verdict="risk_reference", hold={"sharpe": 1.0, "max_dd": -0.2}, n_trials=29,
+        holdout={"sharpe": 0.8, "max_dd": -0.22, "hold_sharpe": 1.0, "hold_max_dd": -0.2, "nw_tstat": -0.5,
+                 "n_days": 500, "picks": [{"fold": "2010", "k_tp": 1.0, "k_sl": 0.5}]},
         summary=pl.DataFrame({"k_tp": [1.0], "k_sl": [0.5], "mean_sharpe": [0.9], "mean_max_dd": [-0.25],
                               "eligible": [False]}),
         variants=pl.DataFrame({"variant": ["hold"], "param": [None], "fold": ["2010"], "sharpe": [1.0],
@@ -301,6 +407,11 @@ def test_evaluation_states_the_b2_verdict_and_all_six_criteria(mcfg, gain, beats
     assert f"Recommendation: {rec}." in md
     for n in range(1, 7):
         assert f"\n| {n} | " in md
+    # the verdict is shown with its out-of-sample (leave-one-fold-out) numbers, not only in-sample ones
+    assert "held-out folds" in checks[-1].detail and "NW t -0.50" in checks[-1].detail
+    assert ("Verdict test (pair picked on the other folds, scored on the held-out fold): net Sharpe 0.80 vs hold "
+            "1.00, max drawdown -22.0% vs hold -20.0%, Newey-West t of the daily difference -0.50 over 500 days") in md
+    assert report["exits"]["holdout"]["nw_tstat"] == -0.5
     report["provenance"] = {"synthetic": False}
     assert "SYNTHETIC" not in report_markdown(report)
 
@@ -342,3 +453,40 @@ def test_coverage_is_judged_on_dates_with_a_fitted_conformal_offset(mcfg):
     none_ok = conformal.with_columns(pl.lit(False).alias("conformal_ok"))
     r2, _, _ = evaluate_forecast(forecast, labels, barriers, b_oof, b_table, mcfg, sel=sel, conformal=none_ok)
     assert r2["coverage_rows"] == "all" and r2["coverage"] == pytest.approx(report["coverage_all_rows"])
+
+
+def _stub_tune_run(ics: dict):
+    """tune.run stand-in: mean_ic per candidate from `ics` keyed by (objective, num_leaves, learning_rate)."""
+    def run(frame, folds, rules, grid, exp_dir, *, cols, seed=0, name="", **kw):
+        m = [ics.get((p.objective, p.num_leaves, p.learning_rate), 0.0) for p in grid]
+        best = max(range(len(m)), key=lambda j: (m[j], -j))
+        return pl.DataFrame({"trial": list(range(len(m))), "params": [json.dumps(dataclasses.asdict(p)) for p in grid],
+                             "mean_ic": m}).with_columns((pl.col("trial") == best).alias("winner"))
+    return run
+
+
+@pytest.mark.parametrize("grid_ic, stage", [(0.04, "objective"), (0.05, "objective"), (0.06, "grid")])
+def test_choose_lgbm_keeps_the_objective_winner_unless_a_grid_point_beats_it(monkeypatch, tmp_path, grid_ic, stage):
+    from ltforecast.models import tune
+    from ltforecast.pipeline import _choose_lgbm
+
+    mcfg = load_model_config()
+    mcfg = dataclasses.replace(mcfg, experiments_dir=tmp_path, lgbm=dataclasses.replace(mcfg.lgbm, tune=True))
+    base = mcfg.lgbm.params
+    # lambdarank at the base point scores 0.05; the grid points on the larger num_leaves / larger learning
+    # rate corner score grid_ic, every other grid point 0.0 (the grid never contains the base point)
+    ics = {("regression", base.num_leaves, base.learning_rate): 0.01,
+           ("lambdarank", base.num_leaves, base.learning_rate): 0.05,
+           ("lambdarank", 2 * base.num_leaves + 1, base.learning_rate * 1.5): grid_ic}
+    monkeypatch.setattr(tune, "run", _stub_tune_run(ics))
+    catalog = SimpleNamespace(model_columns=lambda: ["a"])
+    winner, info = _choose_lgbm(SimpleNamespace(frame=None, folds=None), mcfg, catalog)
+
+    assert info["winner_stage"] == stage
+    if stage == "objective":
+        assert winner == dataclasses.replace(base, objective="lambdarank")
+        assert not info["grid_table"]["winner"].any()
+    else:
+        assert (winner.num_leaves, winner.learning_rate) == (2 * base.num_leaves + 1, base.learning_rate * 1.5)
+        assert info["grid_table"]["winner"].sum() == 1
+    assert info["winner"] == dataclasses.asdict(winner)

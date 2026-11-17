@@ -56,6 +56,9 @@ def probs_on(out: pl.DataFrame, day: dt.date) -> list[float]:
 
 # -- isotonic ----------------------------------------------------------------------------------------
 
+# a pure 0/1 step, held off the endpoints by the calibrator's final [eps, 1 - eps] clip
+STEP = [IsotonicCalibrator.eps, IsotonicCalibrator.eps, 1 - IsotonicCalibrator.eps, 1 - IsotonicCalibrator.eps]
+
 
 def base_spec():
     """A: matured before 2011 (UP). B: label ends 2012-01-31 .. 2012-12-31, so NOT matured on C's first
@@ -78,7 +81,7 @@ def test_immature_rows_of_earlier_folds_are_excluded():
     assert a["prob"].to_list() == [0.5] * 12 and not a["prob_calibrated"].any()
     # folds 2011 and 2012 see only fold 2010's rows: the UP step
     for day in B_DATES + C_DATES:
-        assert probs_on(out, day) == [0.0, 0.0, 1.0, 1.0]
+        assert probs_on(out, day) == STEP
     assert out.filter(pl.col("date") >= B_DATES[0])["prob_calibrated"].all()
     # the test is meaningful: with fold 2011's not-yet-matured rows the map would be flat at 0.5
     score = np.tile([0.125, 0.375, 0.625, 0.875], 6)
@@ -92,7 +95,7 @@ def test_a_row_that_matured_one_day_before_the_fold_is_used():
     out = walk_forward_isotonic(oof_pred(A_DATES + B_DATES + C_DATES), labels_for(spec), FOLDS, min_rows=4, min_dates=1)
     # 3 UP dates + 1 DOWN date: P = 3/4 for the high scores, 1/4 for the low ones
     assert probs_on(out, C_DATES[0]) == [0.25, 0.25, 0.75, 0.75]
-    assert probs_on(out, B_DATES[0]) == [0.0, 0.0, 1.0, 1.0]  # fold 2011 itself is unaffected
+    assert probs_on(out, B_DATES[0]) == STEP  # fold 2011 itself is unaffected
 
 
 def test_fold_order_not_dates_alone_decides_earlier():
@@ -116,7 +119,7 @@ def test_missing_labels_are_scored_not_fitted():
     )
     out = walk_forward_isotonic(oof_pred(A_DATES + B_DATES + C_DATES), lab, FOLDS, min_rows=4, min_dates=1)
     assert out.height == 36
-    assert probs_on(out, C_DATES[0]) == [0.0, 0.0, 1.0, 1.0]  # from A_DATES[2] alone
+    assert probs_on(out, C_DATES[0]) == STEP  # from A_DATES[2] alone
     out = walk_forward_isotonic(oof_pred(A_DATES + B_DATES + C_DATES), lab, FOLDS, min_rows=5, min_dates=1)
     assert not out["prob_calibrated"].any()
 
@@ -139,6 +142,52 @@ def test_isotonic_monotone_and_bounded():
     assert pickle.loads(pickle.dumps(cal)).predict(grid).tolist() == p.tolist()
     with pytest.raises(RuntimeError):
         IsotonicCalibrator().predict(grid)
+
+
+def test_pure_end_runs_do_not_reach_0_or_1():
+    # 1000 distinct scores, 50 bins of 20 rows. y alternates 0/1, except the lowest 5 are all 0 and the
+    # highest 5 all 1 (pure end runs that raw PAVA would map to exactly 0 and 1).
+    # bottom bin: 5 zeros + rows 5..19 alternating (8 ones) = 8/20 = 0.4; top bin: rows 980..994
+    # alternating (7 ones) + 5 ones = 12/20 = 0.6; every middle bin 10/20 = 0.5
+    n = 1000
+    score = (np.arange(n) + 0.5) / n
+    y = (np.arange(n) % 2).astype(float)
+    y[:5] = 0.0
+    y[-5:] = 1.0
+    cal = IsotonicCalibrator().fit(score, y)
+    p = cal.predict(np.array([0.5 / 3000, 0.5 / n, 0.5, 1 - 0.5 / n, 1 - 0.5 / 3000]))
+    assert p.tolist() == pytest.approx([0.4, 0.4, 0.5, 0.6, 0.6])
+    assert cal.n_obs == n
+
+
+def test_sparse_extreme_scores_with_weak_signal_stay_near_the_base_rate():
+    # cross-sections of 1200..1600 names: each date's extreme percentile is a distinct score seen once.
+    # true P(beat) = 0.45 + 0.1 * pct never leaves [0.45, 0.55]
+    rng = np.random.default_rng(1)
+    parts_s, parts_y = [], []
+    for size in rng.integers(1200, 1601, 120):
+        pct = (np.arange(size) + 0.5) / size
+        parts_s.append(pct)
+        parts_y.append((rng.uniform(0, 1, size) < 0.45 + 0.1 * pct).astype(float))
+    cal = IsotonicCalibrator().fit(np.concatenate(parts_s), np.concatenate(parts_y))
+    p = cal.predict(np.array([0.5 / 3000, 0.5 / 1200, 0.5 / 1600, 1 - 0.5 / 1600, 1 - 0.5 / 1200, 1 - 0.5 / 3000]))
+    assert np.all((p > 0.35) & (p < 0.65)), p
+
+
+def test_tied_scores_fit_does_not_depend_on_row_order():
+    # identical 100-name grids on 60 dates: every score is a 60-row tie group
+    rng = np.random.default_rng(2)
+    score = np.tile((np.arange(100) + 0.5) / 100, 60)
+    y = (rng.uniform(0, 1, score.size) < 0.3 + 0.4 * score).astype(float)
+    grid = np.linspace(0, 1, 201)
+    p = IsotonicCalibrator().fit(score, y).predict(grid)
+    for seed in range(3):
+        perm = np.random.default_rng(seed).permutation(score.size)
+        assert IsotonicCalibrator().fit(score[perm], y[perm]).predict(grid).tolist() == pytest.approx(p.tolist())
+    # sort by y within ties: still the same map (a tie group never splits into a pure 0 or 1 part)
+    order = np.lexsort((y, score))
+    assert IsotonicCalibrator().fit(score[order], y[order]).predict(grid).tolist() == pytest.approx(p.tolist())
+    assert 0.0 < p.min() and p.max() < 1.0
 
 
 def test_fit_isotonic_final_uses_only_matured_rows():
@@ -329,7 +378,11 @@ def test_min_dates_boundary(n_dates, ok):
     iso = walk_forward_isotonic(oof, lab, folds, min_rows=2000, min_dates=12).filter(pl.col("date") == TEST_DAY)
     assert iso["prob_calibrated"].all() == ok and iso["prob_calibrated"].any() == ok
     if ok:  # securities 101..200 beat, 1..100 do not: the map is the step 0 -> 1
-        assert iso.sort("security_id")["prob"].to_list() == [0.0] * 100 + [1.0] * 100
+        # fitted on 50 bins of 4 securities (x 12 dates); sklearn interpolates linearly between bin-mean
+        # scores, so the bins 97..100 (mean at 98.5, y 0) and 101..104 (mean at 102.5, y 1) give
+        # securities 99..102 the values (s - 98.5) / 4; the rest sit at the eps-clipped 0 and 1
+        expected = [STEP[0]] * 98 + [0.125, 0.375, 0.625, 0.875] + [STEP[-1]] * 98
+        assert iso.sort("security_id")["prob"].to_list() == pytest.approx(expected)
     assert (fit_isotonic(oof, lab, before=TEST_DAY, min_rows=2000, min_dates=12) is not None) == ok
     cf = walk_forward_conformal(q, lab_q, folds, min_rows=2000, min_dates=12).filter(pl.col("date") == TEST_DAY)
     assert cf["conformal_ok"].all() == ok and cf["conformal_ok"].any() == ok

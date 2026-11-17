@@ -85,7 +85,7 @@ class NoSkill:
     def __init__(self, name: str = "b0_no_skill"):
         self.name = name
 
-    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None) -> NoSkill:
+    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None, *, full: pl.DataFrame | None = None) -> NoSkill:
         return self
 
     def predict(self, df: pl.DataFrame) -> np.ndarray:
@@ -101,7 +101,8 @@ class SingleFactor:
         self.col, self.sign = col, int(sign)
         self.name = name or f"b1_{col}"
 
-    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None) -> SingleFactor:
+    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None, *, full: pl.DataFrame | None = None
+            ) -> SingleFactor:
         return self
 
     def predict(self, df: pl.DataFrame) -> np.ndarray:
@@ -133,7 +134,8 @@ class FactorComposite:
     def columns(self) -> list[str]:
         return [c for members in self.themes.values() for c, _ in members]
 
-    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None) -> FactorComposite:
+    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None, *, full: pl.DataFrame | None = None
+            ) -> FactorComposite:
         return self
 
     def theme_scores(self, df: pl.DataFrame) -> pl.DataFrame:
@@ -155,7 +157,9 @@ class Ridge:
 
     `fit(train, valid)`: one ridge per alpha on `train`, each scored by `ic_or_zero` on `valid`; the
     best mean IC wins (ties go to the larger alpha, i.e. more shrinkage), and the final model is
-    refit with that alpha on train + valid. With a single alpha no validation set is needed.
+    refit with that alpha on `full` when given (the runner's refit frame, including the purged months
+    between train and valid), else on train + valid. With a single alpha no validation set is needed.
+    Alpha selection never sees `full`.
     After fit: `alpha_`, `valid_ic_` {alpha: IC}, `coef_` (in `cols` order), `intercept_`."""
 
     def __init__(
@@ -183,7 +187,7 @@ class Ridge:
         df = df.filter(pl.col(self.target).cast(pl.Float64).is_finite())
         return _matrix(df, self.cols), df[self.target].cast(pl.Float64).to_numpy()
 
-    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None) -> Ridge:
+    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None, *, full: pl.DataFrame | None = None) -> Ridge:
         has_valid = valid is not None and not valid.is_empty()
         if len(self.alphas) == 1 or not has_valid:
             if len(self.alphas) > 1:
@@ -201,7 +205,7 @@ class Ridge:
                 self.valid_ic_[a] = ic if math.isfinite(ic) else -math.inf
             best = max(self.valid_ic_.values())
             self.alpha_ = max(a for a, ic in self.valid_ic_.items() if ic == best)
-        parts = [train] + ([valid] if has_valid else [])
+        parts = [full] if full is not None else [train] + ([valid] if has_valid else [])
         x, y = self._xy(pl.concat([p.select(*self.cols, self.target) for p in parts], how="vertical_relaxed"))
         if y.size == 0:
             raise ValueError("ridge: no labelled rows to fit on")

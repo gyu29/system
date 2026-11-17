@@ -8,9 +8,11 @@ Conventions
 - Early stopping, for both objectives, is on the mean per-date Spearman IC of the valid set (custom
   feval, higher is better). The per-date ranks use average ranks for ties, and a date on which the
   prediction or the target is constant scores IC 0, as in `validation.metrics`.
-- `refit=True`: after early stopping on (train, valid) the model is refit on train + valid for
-  `best_iteration` rounds with the same seed; without a valid set it trains `n_estimators_no_valid`.
-  `refit_from(train, valid)` turns an early-stopped refit=False model into that refit=True model
+- `refit=True`: after early stopping on (train, valid) the model is refit on `full` (the runner's
+  refit frame: every labelled row of the training dates, including the purged months between train
+  and valid) or, when `full` is None, on train + valid, for `best_iteration` rounds with the same seed;
+  without a valid set it trains `n_estimators_no_valid` on train. Early stopping never sees `full`.
+  `refit_from(train, valid, full=)` turns an early-stopped refit=False model into that refit=True model
   without repeating the early-stopping pass (used by the ensemble).
 - lambdarank: label = decile 0..9 of `target` within the date (ceil(avg rank * 10 / n) - 1),
   label_gain = 0..9, query size <= 10_000 rows (LightGBM's limit).
@@ -209,7 +211,7 @@ class LGBM:
 
     # fit / predict
 
-    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None) -> LGBM:
+    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None, *, full: pl.DataFrame | None = None) -> LGBM:
         p, params = self.params, self._lgb_params()
         tr = self._prepare(train)
         if len(tr.y) == 0:
@@ -230,27 +232,27 @@ class LGBM:
             self.best_iteration = int(booster.best_iteration) or booster.current_iteration()
             self.valid_ic = float(booster.best_score["valid"]["ic"])
             if p.refit:
-                self._train_full(train, valid)
+                self._train_full(train, valid, full)
             else:
                 self.booster = lgb.Booster(model_str=booster.model_to_string(num_iteration=self.best_iteration))
         self.expected_value = float(self.booster.predict(tr.X[:1], pred_contrib=True)[0, -1])
         return self
 
-    def _train_full(self, train: pl.DataFrame, valid: pl.DataFrame) -> None:
-        """Booster on train + valid for `best_iteration` rounds (no early stopping)."""
-        both = self._prepare(pl.concat([train, valid], how="diagonal_relaxed"))
+    def _train_full(self, train: pl.DataFrame, valid: pl.DataFrame, full: pl.DataFrame | None = None) -> None:
+        """Booster on `full` (else train + valid) for `best_iteration` rounds (no early stopping)."""
+        both = self._prepare(full if full is not None else pl.concat([train, valid], how="diagonal_relaxed"))
         self.booster = lgb.train(self._lgb_params(), self._dataset(both), num_boost_round=self.best_iteration)
 
-    def refit_from(self, train: pl.DataFrame, valid: pl.DataFrame) -> LGBM:
+    def refit_from(self, train: pl.DataFrame, valid: pl.DataFrame, *, full: pl.DataFrame | None = None) -> LGBM:
         """A new refit=True LGBM built from this early-stopped (refit=False) one, reusing its
         `best_iteration` / `valid_ic` instead of re-running the deterministic early-stopping pass.
-        Equals `LGBM(..., refit=True).fit(train, valid)` for the same (train, valid)."""
+        Equals `LGBM(..., refit=True).fit(train, valid, full=full)` for the same frames."""
         if self.booster is None or self.valid_ic is None:
             raise RuntimeError(f"{self.name}: refit_from needs a model fit with a validation set")
         out = LGBM(self.cols, dataclasses.replace(self.params, refit=True), self.seed, self.name,
                    target=self.target)
         out.best_iteration, out.valid_ic = self.best_iteration, self.valid_ic
-        out._train_full(train, valid)
+        out._train_full(train, valid, full)
         out.expected_value = float(out.booster.predict(out._prepare(train).X[:1], pred_contrib=True)[0, -1])
         return out
 
@@ -295,15 +297,17 @@ class SeedAverage:
         return SeedAverage(self.cols, dataclasses.replace(self.params, **changes), self.seeds, self.name,
                            target=self.target)
 
-    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None) -> SeedAverage:
+    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None, *, full: pl.DataFrame | None = None
+            ) -> SeedAverage:
         for m in self.members:
-            m.fit(train, valid)
+            m.fit(train, valid, full=full)
         return self
 
-    def refit_from(self, train: pl.DataFrame, valid: pl.DataFrame) -> SeedAverage:
+    def refit_from(self, train: pl.DataFrame, valid: pl.DataFrame, *, full: pl.DataFrame | None = None
+                   ) -> SeedAverage:
         """refit=True copy of this early-stopped average: each seed reuses its best_iteration (LGBM.refit_from)."""
         out = self.with_params(refit=True)
-        out.members = [m.refit_from(train, valid) for m in self.members]
+        out.members = [m.refit_from(train, valid, full=full) for m in self.members]
         return out
 
     def predict(self, df: pl.DataFrame) -> np.ndarray:

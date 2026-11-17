@@ -34,8 +34,11 @@ import datetime as dt
 import functools
 import json
 import math
+import os
 import re
+import shutil
 import time
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -134,6 +137,8 @@ def load_inputs(store: Store, cfg: Config, mcfg: ModelConfig, catalog: Catalog, 
     frame = modeling_frame(store, cfg, catalog, periods=("dev",)).filter(pl.col("date") <= through)
     if frame.is_empty():
         raise ValueError("no development rows: run `ltforecast labels` and `ltforecast features` first")
+    calendar = store.scan("benchmark_daily").select("date").collect().to_series().sort()
+    check_labels_before_holdout(frame, calendar, max(cfg.labels.horizons.values()), cfg.dates.holdout_start)
     folds = walk_forward_folds(frame["date"].unique(), mcfg.validation, through)
     raw = (
         store.scan("features_raw")
@@ -143,11 +148,37 @@ def load_inputs(store: Store, cfg: Config, mcfg: ModelConfig, catalog: Catalog, 
     )
     prices = store.scan("prices_daily").select("security_id", "date", "open", "close", "adj_close", "ret").collect()
     securities = store.scan("securities").collect()
-    calendar = store.scan("benchmark_daily").select("date").collect().to_series().sort()
     return Inputs(
         frame=frame, folds=folds, features_raw=raw, prices=prices, securities=securities, calendar=calendar,
         delist=delisting_returns(securities, cfg.delisting, calendar), through=through,
     )
+
+
+def check_labels_before_holdout(frame: pl.DataFrame, calendar: pl.Series, horizon_days: int,
+                                holdout_start: dt.date) -> None:
+    """Raise ValueError unless every label window of the dev rows in `frame` ends before `holdout_start`.
+
+    Two checks: (1) the max of every non-null `label_end_*` column; (2) the window of the LAST dev date
+    stepped `horizon_days` trading days along `calendar` (the longest horizon: it bounds the targets and
+    the barrier / exit paths, which read prices directly). A window running off the calendar end is safe
+    only while the calendar itself ends before the holdout (no holdout price exists yet).
+    """
+    fix = "move dates.dev_end back or dates.holdout_start forward"
+    for c in (c for c in frame.columns if c.startswith("label_end_")):
+        end = frame[c].max()
+        if end is not None and end >= holdout_start:
+            first = frame.filter(pl.col(c) >= holdout_start)["date"].min()
+            raise ValueError(f"dev rows from {first} have {c} up to {end}, on/after holdout_start {holdout_start}: {fix}")
+    last = frame["date"].max()
+    cal = calendar.sort().to_numpy()
+    i = int(np.searchsorted(cal, np.datetime64(last, "D"), side="right")) - 1 + horizon_days
+    end = calendar.sort()[i] if i < len(cal) else None
+    if end is None and calendar.max() >= holdout_start:
+        raise ValueError(f"the {horizon_days}-day window of dev date {last} runs past the price calendar, which "
+                         f"already reaches into the holdout (holdout_start {holdout_start}): {fix}")
+    if end is not None and end >= holdout_start:
+        raise ValueError(f"the {horizon_days}-day label window of dev date {last} ends {end}, on/after "
+                         f"holdout_start {holdout_start}: {fix}")
 
 
 def _need_folds(folds: Sequence[Fold]) -> None:
@@ -242,12 +273,14 @@ def _choose_lgbm(inp: Inputs, mcfg: ModelConfig, catalog: Catalog) -> tuple[Any,
     objs = tune.objectives(mcfg.lgbm.params)
     t_obj = tune.run(inp.frame, inp.folds, rules, objs, exp, cols=cols, seed=seed, name="lgbm_objective")
     winner = tune.best(t_obj, objs)
-    info = {"objective_table": t_obj, "grid_table": None}
+    info = {"objective_table": t_obj, "grid_table": None, "winner_stage": "objective"}
     if mcfg.lgbm.tune:
         grid = tune.grid(winner)
         t_grid = tune.run(inp.frame, inp.folds, rules, grid, exp, cols=cols, seed=seed, name="lgbm_grid")
-        winner = tune.best(t_grid, grid)
+        # the grid never contains its base point: keep the objective winner unless a grid point beats it
+        winner, stage, t_grid = tune.choose(t_obj, objs, t_grid, grid)
         info["grid_table"] = t_grid
+        info["winner_stage"] = stage
     info["winner"] = dataclasses.asdict(winner)
     return winner, info
 
@@ -494,7 +527,8 @@ def train(store: Store, cfg: Config, mcfg: ModelConfig, catalog: Catalog) -> Tra
     cost = mcfg.costs_bps / 1e4
     lv = mcfg.levels
     ent = exit_entries(oof, sigma_oof.rename({"sigma_hat": "sigma"}), lv.top_fraction)
-    paths = position_paths(inp.prices, ent, inp.delist, inp.calendar, horizon)
+    paths = position_paths(inp.prices, ent, inp.delist, inp.calendar, horizon,
+                           stale_days=cfg.labels.stale_price_days)
     sdays = signal_exit_days(paths, oof.select("security_id", "date", "rank_pct"), lv.signal_threshold)
     sel = select_pair(paths, barriers, cost=cost, k_trail=lv.k_trail, signal_days=sdays,
                       signal_threshold=lv.signal_threshold)
@@ -506,12 +540,12 @@ def train(store: Store, cfg: Config, mcfg: ModelConfig, catalog: Catalog) -> Tra
              "signal_threshold": lv.signal_threshold, "cost": cost, "top_fraction": lv.top_fraction,
              "folds": fold_names},
             {"k_tp": sel.k_tp, "k_sl": sel.k_sl, "verdict": sel.verdict, "hold": sel.hold,
-             "summary": sel.summary.to_dicts()},
+             "holdout": sel.holdout, "summary": sel.summary.to_dicts()},
             n_trials=sel.n_trials)
     chosen = dataclasses.replace(barriers, k_tp=(sel.k_tp,), k_sl=(sel.k_sl,))
     bar = barrier_labels(
         inp.prices, sigma_all.select("security_id", "date", pl.col("sigma_hat").alias("sigma")),
-        inp.delist, inp.calendar, horizon, chosen,
+        inp.delist, inp.calendar, horizon, chosen, stale_days=cfg.labels.stale_price_days,
     ).select(*KEYS, "outcome", "exit_ret", "exit_day")
     bar.write_parquet(out_dir / "barrier_labels.parquet")
 
@@ -591,6 +625,7 @@ def train(store: Store, cfg: Config, mcfg: ModelConfig, catalog: Catalog) -> Tra
     sigma_all.write_parquet(paths["sigma_hat"])
     _write_json(paths["state"], {
         "lgbm_params": dataclasses.asdict(winner), "k_tp": sel.k_tp, "k_sl": sel.k_sl, "verdict": sel.verdict,
+        "exit_holdout": sel.holdout,
         "hit_method": method, "recommendation": rec, "folds": fold_names, "dev_end": inp.through,
         "model_config_hash": config_hash(mcfg.raw), "fast": mcfg.fast,
         "effective_config_hash": effective_config_hash(mcfg), "data_fingerprint": data_fingerprint(inp.frame),
@@ -656,13 +691,17 @@ def evaluate_forecast(
         pl.col("k_tp").eq_missing(sel.k_tp) & pl.col("k_sl").eq_missing(sel.k_sl)
     ).to_dicts()
     chosen = chosen[0] if chosen else {"mean_sharpe": math.nan, "mean_max_dd": math.nan}
+    oos = sel.holdout or {}
     tpsl = {
         "beats_hold": sel.verdict == "exit_orders",
         "p_gap": hc["gap"],
         "p_gap_class": hc["worst"],
         "p_tested": hc["tested"],
         "p_applicable": hc["applicable"],
-        "detail": (f"pair k_tp={sel.k_tp}, k_sl={sel.k_sl}: mean net Sharpe {chosen['mean_sharpe']:.2f} vs hold "
+        "detail": (f"pair k_tp={sel.k_tp}, k_sl={sel.k_sl}; held-out folds (leave one fold out): net Sharpe "
+                   f"{_fmt(oos.get('sharpe'), '.2f')} vs hold {_fmt(oos.get('hold_sharpe'), '.2f')}, max drawdown "
+                   f"{_fmt(oos.get('max_dd'), '.1%')} vs hold {_fmt(oos.get('hold_max_dd'), '.1%')}, NW t "
+                   f"{_fmt(oos.get('nw_tstat'), '.2f')}; in-sample mean Sharpe {chosen['mean_sharpe']:.2f} vs hold "
                    f"{sel.hold['sharpe']:.2f}, mean max drawdown {chosen['mean_max_dd']:.1%} vs hold {hold_dd:.1%}"),
     }
     checks = M.check_criteria(report, crit, vs_baseline=paired, coverage=coverage, calibration_gap=prob_gap,
@@ -705,7 +744,7 @@ def evaluate_forecast(
         "tp_calibration": hc["tables"].get("tp", pl.DataFrame()),
         "tp_calibration_gap": hc["gaps"].get("tp", math.nan),
         "exits": {"k_tp": sel.k_tp, "k_sl": sel.k_sl, "verdict": sel.verdict, "hold": sel.hold,
-                  "summary": sel.summary, "variants": sel.variants, "n_trials": sel.n_trials},
+                  "holdout": oos, "summary": sel.summary, "variants": sel.variants, "n_trials": sel.n_trials},
         "deflated_sharpe": dsr,
         "trial_count": n_trials,
         "baselines": baseline_table,
@@ -744,6 +783,16 @@ def _hit_calibration_line(r: dict) -> str:
         return "hit-probability calibration not applicable (hold pair, no barriers)."
     per = ", ".join(f"{c} {_fmt(g, '.3f')}" for c, g in hc["gaps"].items()) or "none tested"
     return f"largest hit-probability calibration gap {_fmt(hc['gap'], '.3f')} ({hc['worst'] or 'n/a'}; per class: {per})."
+
+
+def _holdout_line(h: dict) -> str:
+    """The out-of-sample numbers behind the TP/SL verdict (exits.holdout_verdict)."""
+    if not h or not h.get("picks"):
+        return "Verdict test: fewer than two folds or no eligible pair, so nothing was held out."
+    return (f"Verdict test (pair picked on the other folds, scored on the held-out fold): net Sharpe "
+            f"{_fmt(h.get('sharpe'), '.2f')} vs hold {_fmt(h.get('hold_sharpe'), '.2f')}, max drawdown "
+            f"{_fmt(h.get('max_dd'), '.1%')} vs hold {_fmt(h.get('hold_max_dd'), '.1%')}, Newey-West t of the daily "
+            f"difference {_fmt(h.get('nw_tstat'), '.2f')} over {h.get('n_days', 0)} days (exit orders need t >= 2).")
 
 
 def report_markdown(r: dict) -> str:
@@ -789,6 +838,10 @@ def report_markdown(r: dict) -> str:
                 _md_table(lg["objective_table"].drop("params")), ""]
     if lg.get("grid_table") is not None:
         out += [f"Tuning grid: {lg['grid_table'].height} trials.", ""]
+    if lg.get("winner_stage"):
+        kept = ("objective stage (no grid point beat it; base point kept)"
+                if lg["winner_stage"] == "objective" else "tuning grid")
+        out += [f"Shipped LightGBM config comes from the {kept}.", ""]
     w = ex.get("ensemble_weights") or {}
     if w:
         rows = [{"fold": f, **{k: v for k, v in d["weights"].items()}} for f, d in w.items()]
@@ -815,6 +868,7 @@ def report_markdown(r: dict) -> str:
             f"Chosen pair k_tp={x['k_tp']}, k_sl={x['k_sl']}; verdict **{x['verdict']}** "
             + ("(levels are exit orders)." if x["verdict"] == "exit_orders"
                else "(levels are shown as risk reference levels, not exit orders)."),
+            _holdout_line(x.get("holdout") or {}),
             f"Plain hold: mean net Sharpe {_fmt(x['hold']['sharpe'], '.2f')}, mean max drawdown "
             f"{_fmt(x['hold']['max_dd'], '.1%')}. {x['n_trials']} configurations counted.", "",
             _md_table(x["summary"].sort("mean_sharpe", descending=True, nulls_last=True).head(10)), "",
@@ -863,10 +917,30 @@ class FinalModels:
 FINAL_FILES = ("ensemble", "vol", "quantile", "isotonic", "hit_table", "hit_classifier")
 
 
-def _fit_meta(frame: pl.DataFrame, target: str, extra: dict | None = None) -> dict:
-    rows = frame.filter(pl.col(target).is_not_null())
-    return {"fit_rows": rows.height, "fit_date_min": rows["date"].min(), "fit_date_max": rows["date"].max(),
-            "target": target, **(extra or {})}
+class _Recording:
+    """Wraps a model for `runner.fit_on_all` and keeps the keys of the labelled rows its fit received:
+    `full` when the runner passes one (the refit frame), else train + valid."""
+
+    def __init__(self, model: Any, target: str) -> None:
+        self.model, self.target, self.fitted = model, target, None
+
+    def fit(self, train: pl.DataFrame, valid: pl.DataFrame | None, **kw: Any) -> _Recording:
+        full = kw.get("full")
+        parts = [full] if full is not None else [p for p in (train, valid) if p is not None]
+        self.fitted = pl.concat([p.filter(pl.col(self.target).is_not_null()).select("date") for p in parts])
+        self.model.fit(train, valid, **kw)
+        return self
+
+
+def fit_all_recorded(make_model, frame: pl.DataFrame, rules, *, target: str = "target") -> tuple[Any, dict]:
+    """`runner.fit_on_all` plus metadata of the rows the model was actually fit on: fit_rows, fit_dates,
+    fit_date_min / max, and labelled_rows (every labelled row of `frame`, purge/embargo months included)."""
+    rec = fit_on_all(lambda: _Recording(make_model(), target), frame, rules, target=target)
+    d = rec.fitted["date"]
+    return rec.model, {
+        "fit_rows": d.len(), "fit_dates": d.n_unique(), "fit_date_min": d.min(), "fit_date_max": d.max(),
+        "labelled_rows": frame.filter(pl.col(target).is_not_null()).height, "target": target,
+    }
 
 
 def min_cross_section(frame: pl.DataFrame, mcfg: ModelConfig) -> int:
@@ -880,17 +954,12 @@ def min_cross_section(frame: pl.DataFrame, mcfg: ModelConfig) -> int:
 def fit_final(store: Store, cfg: Config, mcfg: ModelConfig, catalog: Catalog, *, through: dt.date | None = None
               ) -> Path:
     """Refit everything on all dev rows dated <= `through` (default dev_end) -> models/final/.
-    Needs the train outputs (winner params, chosen pair and method, OOF predictions)."""
-    from ltforecast.calibrate import fit_isotonic, latest_conformal_offset
-    from ltforecast.hitprob import HitClassifier
-    from ltforecast.levels import barrier_labels
-    from ltforecast.models.io import save_model
-    from ltforecast.models.lgbm import LGBMParams
-    from ltforecast.models.quantile import QuantileModel
-    from ltforecast.models.vol import LVOL_COLS, VolModel, vol_frame
+    Needs the train outputs (winner params, chosen pair and method, OOF predictions).
 
-    odir = oof_dir(store)
-    state_path = odir / "train_state.json"
+    Written atomically: every artifact goes to models/final.tmp-<run_id>/, which replaces models/final/
+    only after metadata.json is written; a failure leaves the previous models/final/ untouched. Every
+    sidecar and metadata.json carry the same run_id, which load_final checks."""
+    state_path = oof_dir(store) / "train_state.json"
     if not state_path.exists():
         raise FileNotFoundError(f"{state_path} missing: run `ltforecast train` first")
     state = json.loads(state_path.read_text())
@@ -902,28 +971,65 @@ def fit_final(store: Store, cfg: Config, mcfg: ModelConfig, catalog: Catalog, *,
     if changed:
         raise ValueError(f"development data changed since train on {len(changed)} dates (first {changed[0]}): "
                          "re-run `ltforecast train`")
+    # every artifact goes to a fresh sibling directory that replaces models/final/ only once metadata.json
+    # is written, so a failed refit never leaves new pickles beside an old metadata.json
+    live = final_dir(store)
+    run_id = uuid.uuid4().hex
+    out = live.with_name(f"{live.name}.tmp-{run_id}")
+    for stale in live.parent.glob(f"{live.name}.tmp-*") if live.parent.exists() else ():
+        shutil.rmtree(stale, ignore_errors=True)
+    out.mkdir(parents=True)
+    try:
+        _fit_final_into(out, run_id, store, cfg, mcfg, catalog, state, inp)
+    except BaseException:
+        shutil.rmtree(out, ignore_errors=True)
+        raise
+    old = live.with_name(f"{live.name}.old-{run_id}")
+    if live.exists():
+        os.replace(live, old)
+    try:
+        os.replace(out, live)
+    except BaseException:
+        if old.exists():
+            os.replace(old, live)
+        raise
+    shutil.rmtree(old, ignore_errors=True)
+    return live
+
+
+def _fit_final_into(out: Path, run_id: str, store: Store, cfg: Config, mcfg: ModelConfig, catalog: Catalog,
+                    state: dict, inp: Inputs) -> None:
+    """The body of fit_final, writing every artifact into `out` (metadata.json last)."""
+    from ltforecast.calibrate import fit_isotonic, latest_conformal_offset
+    from ltforecast.hitprob import HitClassifier
+    from ltforecast.levels import barrier_labels
+    from ltforecast.models.io import save_model
+    from ltforecast.models.lgbm import LGBMParams
+    from ltforecast.models.quantile import QuantileModel
+    from ltforecast.models.vol import LVOL_COLS, VolModel, vol_frame
+
+    through, odir = inp.through, oof_dir(store)
     rules, cols, cal = mcfg.validation, catalog.model_columns(), mcfg.calibration
     barriers = cfg.labels.barriers
     horizon = cfg.labels.horizons[barriers.horizon]
     labels = inp.labels
     k_tp, k_sl = state["k_tp"], state["k_sl"]
-    out = final_dir(store)
-    out.mkdir(parents=True, exist_ok=True)
-    common = {"trained_through": through, "columns": cols}
+    common = {"trained_through": through, "columns": cols, "run_id": run_id}
 
     winner = LGBMParams(**state["lgbm_params"])
-    ens = fit_on_all(ensemble_factory(catalog, mcfg, winner), inp.frame, rules)
-    save_model(ens, out / "ensemble.pkl", common | _fit_meta(inp.frame, "target", {
-        "params": winner, "seeds": mcfg.lgbm.seeds, "weights": ens.weights_}))
+    ens, m = fit_all_recorded(ensemble_factory(catalog, mcfg, winner), inp.frame, rules)
+    save_model(ens, out / "ensemble.pkl", common | m | {
+        "params": winner, "seeds": mcfg.lgbm.seeds, "weights": ens.weights_})
 
     vf = vol_frame(inp.features_raw, inp.frame, inp.prices, inp.securities)
-    vol = fit_on_all(functools.partial(VolModel, mcfg.vol), vf, rules, target=VOL_TARGET)
-    save_model(vol, out / "vol.pkl", common | _fit_meta(vf, VOL_TARGET, {"params": mcfg.vol}))
+    vol, m = fit_all_recorded(functools.partial(VolModel, mcfg.vol), vf, rules, target=VOL_TARGET)
+    save_model(vol, out / "vol.pkl", common | m | {"params": mcfg.vol})
 
     qframe = inp.frame.join(vf.select(*KEYS, *LVOL_COLS), on=list(KEYS), how="left")
     q = mcfg.quantile
-    qm = fit_on_all(functools.partial(QuantileModel, cols, q.alphas, q.params, q.seed), qframe, rules, target=Q_TARGET)
-    save_model(qm, out / "quantile.pkl", common | _fit_meta(qframe, Q_TARGET, {"params": q.params, "alphas": q.alphas}))
+    qm, m = fit_all_recorded(functools.partial(QuantileModel, cols, q.alphas, q.params, q.seed), qframe, rules,
+                             target=Q_TARGET)
+    save_model(qm, out / "quantile.pkl", common | m | {"params": q.params, "alphas": q.alphas})
 
     # calibration maps from the walk-forward OOF rows dated <= through (all of their labels have ended)
     end = dt.date(9999, 12, 31)
@@ -945,14 +1051,16 @@ def fit_final(store: Store, cfg: Config, mcfg: ModelConfig, catalog: Catalog, *,
     sig = vf.select(*KEYS).with_columns(pl.Series("sigma_hat", vol.predict(vf), dtype=pl.Float64))
     chosen = dataclasses.replace(barriers, k_tp=(k_tp,), k_sl=(k_sl,))
     bar = barrier_labels(inp.prices, sig.select("security_id", "date", pl.col("sigma_hat").alias("sigma")),
-                         inp.delist, inp.calendar, horizon, chosen)
+                         inp.delist, inp.calendar, horizon, chosen, stale_days=cfg.labels.stale_price_days)
     hframe = _join(_join(inp.frame, sig, ["sigma_hat"]), bar, ["outcome"])
     hc = mcfg.hit_classifier
-    clf = fit_on_all(functools.partial(HitClassifier, cols, hc.params, hc.seed), hframe, rules, target="outcome")
-    save_model(clf, out / "hit_classifier.pkl", common | _fit_meta(hframe, "outcome", {"params": hc.params}))
+    clf, m = fit_all_recorded(functools.partial(HitClassifier, cols, hc.params, hc.seed), hframe, rules,
+                              target="outcome")
+    save_model(clf, out / "hit_classifier.pkl", common | m | {"params": hc.params})
 
     prov = provenance(store)
     meta = {
+        "run_id": run_id,
         "git_commit": git_state()[0],
         "created_utc": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
         "trained_through": through,
@@ -968,6 +1076,7 @@ def fit_final(store: Store, cfg: Config, mcfg: ModelConfig, catalog: Catalog, *,
         "synthetic": prov.get("synthetic"),
         "lgbm_params": winner,
         "k_tp": k_tp, "k_sl": k_sl, "verdict": state["verdict"],
+        "exit_holdout": state.get("exit_holdout"),
         "barriers": {"tp_bounds": barriers.tp_bounds, "sl_bounds": barriers.sl_bounds, "horizon": barriers.horizon},
         "hit_method": state["hit_method"],
         "market_return": mcfg.levels.market_return,
@@ -976,17 +1085,27 @@ def fit_final(store: Store, cfg: Config, mcfg: ModelConfig, catalog: Catalog, *,
         "fit_date_max": max(inp.frame["date"].max(), forecast["date"].max()),
     }
     _write_json(out / "metadata.json", meta)
-    return out
 
 
 def load_final(path: Path | str) -> FinalModels:
-    """The models/final/ directory written by fit_final (pickles verified against their sidecars)."""
+    """The models/final/ directory written by fit_final. Each pickle is verified against its sidecar
+    (sha256), and every sidecar must carry metadata.json's run_id, trained_through and feature columns:
+    artifacts of different fit_final runs, or written before run ids existed, are refused."""
     from ltforecast.config import BarrierRules
     from ltforecast.models.io import load_model
 
     path = Path(path)
     meta = json.loads((path / "metadata.json").read_text())
-    objs = {name: load_model(path / f"{name}.pkl")[0] for name in FINAL_FILES}
+    if not meta.get("run_id"):
+        raise ValueError(f"{path}/metadata.json has no run_id (written by an older fit-final): re-run `ltforecast fit-final`")
+    want = {"run_id": meta["run_id"], "trained_through": meta["trained_through"], "columns": meta["feature_columns"]}
+    objs = {}
+    for name in FINAL_FILES:
+        objs[name], side = load_model(path / f"{name}.pkl")
+        bad = sorted(k for k, v in want.items() if side.get(k) != v)
+        if bad:
+            raise ValueError(f"{path}/{name}.pkl: sidecar {bad} does not match metadata.json "
+                             f"(mixed fit-final runs): re-run `ltforecast fit-final`")
     b = meta["barriers"]
     barriers = BarrierRules(
         horizon=b["horizon"], k_tp=(meta["k_tp"],), k_sl=(meta["k_sl"],), tp_bounds=tuple(b["tp_bounds"]),

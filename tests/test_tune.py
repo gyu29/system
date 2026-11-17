@@ -75,3 +75,33 @@ def test_run_needs_three_folds(tmp_path):
         tune.run(df, folds, RULES, [TINY], tmp_path, cols=COLS)
     with pytest.raises(ValueError, match="empty"):
         tune.run(df, folds, RULES, [], tmp_path, cols=COLS)
+
+
+def _table(ics):
+    best = max(range(len(ics)), key=lambda j: (ics[j], -j))
+    return pl.DataFrame({"trial": list(range(len(ics))), "mean_ic": ics}).with_columns(
+        (pl.col("trial") == best).alias("winner"))
+
+
+def test_choose_keeps_objective_winner_when_it_beats_every_grid_point():
+    objs = tune.objectives(LGBMParams())
+    t_obj = _table([0.050, 0.030])  # regression base wins the objective stage at 0.050
+    grid = tune.grid(objs[0])
+    t_grid = _table([0.045 + 0.0002 * i for i in range(len(grid))])  # best grid point 0.048 < 0.050
+    p, stage, t_grid2 = tune.choose(t_obj, objs, t_grid, grid)
+    assert p == objs[0] and stage == "objective"
+    assert t_grid2["winner"].sum() == 0  # no grid row is flagged as the shipped config
+
+
+def test_choose_takes_grid_winner_only_when_strictly_better():
+    objs = tune.objectives(LGBMParams())
+    t_obj = _table([0.050, 0.030])
+    grid = tune.grid(objs[0])
+    tie = [0.040] * len(grid)
+    tie[3] = 0.050  # ties the objective winner: the earlier-evaluated config keeps it
+    p, stage, _ = tune.choose(t_obj, objs, _table(tie), grid)
+    assert p == objs[0] and stage == "objective"
+    tie[3] = 0.051
+    p, stage, t_grid2 = tune.choose(t_obj, objs, _table(tie), grid)
+    assert p == grid[3] and stage == "grid"
+    assert t_grid2["winner"].to_list() == [i == 3 for i in range(len(grid))]

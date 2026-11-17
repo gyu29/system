@@ -23,8 +23,9 @@ PERIODS = ("dev", "gap", "holdout", "live")
 LOCKED_PERIODS = frozenset({"gap", "holdout"})
 
 # How a label column is recognised (the `labels` table, see labels.build_labels). `excess_` also
-# covers `excess_w_*`. The walk-forward runner strips these before a model predicts.
-LABEL_PREFIXES = ("fwd_ret_", "bench_ret_", "excess_", "rank_", "realized_vol_", "label_end_")
+# covers `excess_w_*`; `log_rvol_` is the vol model's target (log realized_vol). The walk-forward runner
+# strips these before a model predicts.
+LABEL_PREFIXES = ("fwd_ret_", "bench_ret_", "excess_", "rank_", "realized_vol_", "label_end_", "log_rvol_")
 LABEL_NAMES = ("target", "period")
 
 

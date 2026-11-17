@@ -10,6 +10,9 @@ export FRED_API_KEY=...               # free, https://fred.stlouisfed.org/docs/a
 .venv/bin/ltforecast check            # exits 1 on any FAIL; writes data/reports/{coverage,spot_check}.csv
 .venv/bin/ltforecast labels           # data/core/{labels,benchmark_daily,barrier_labels}
 .venv/bin/ltforecast features         # data/core/{features_raw,features}; data/reports/feature_{ic,shift_test}.csv
+.venv/bin/ltforecast baselines        # data/models/oof/<baseline>.parquet; data/reports/baselines.csv
+.venv/bin/ltforecast train            # data/models/oof/forecast.parquet; data/reports/train_report.{md,json}
+.venv/bin/ltforecast fit-final        # data/models/final/ (every model refit on all development rows)
 .venv/bin/pytest
 ```
 
@@ -23,8 +26,10 @@ core tables came from in `data/core/PROVENANCE.json` (`{"synthetic": true, ...}`
 SYNTHETIC DATA warning, or `{"synthetic": false}`).
 
 Config: `config/universe.yaml` (universe filters, holdout dates, PIT, delisting and label rules),
-`config/features.yaml` (the feature catalog), `config/model.yaml` (validation rules and the
-pre-registered success criteria).
+`config/features.yaml` (the feature catalog), `config/model.yaml` (validation rules, the
+pre-registered success criteria and the Phase 5-6 model settings). `baselines`, `train` and `fit-final`
+read the `model.yaml` next to `--config` (or `--model-config`); `--fast` applies the file's `fast`
+block (fewer seeds, no tuning grid, fewer Monte Carlo paths) and never changes folds, purge or criteria.
 
 ## Labels (`labels.py`, `levels.py`)
 
@@ -80,6 +85,42 @@ families, each with its definition, source fields, lookback, availability lag an
   and are never tuned.
 - `experiments.log_run` appends every run to `experiments/runs.csv` (config hash, git commit, metrics,
   trial count); the trial count feeds the deflated Sharpe.
+
+## Baselines (`models/baselines.py`)
+
+- B0 predicts 0 for everyone (IC exactly 0); B1 is one signed factor (momentum 12-1, gross
+  profitability, earnings yield); B2 averages the signed ranks of five themes (value, quality,
+  momentum, low vol, low investment) with nothing fitted; B3 is a ridge on every ranked feature with
+  alpha chosen by inner-validation IC.
+- `ltforecast baselines` walks all six through the same purged folds as the main model. B2 is the bar:
+  if the main model cannot beat it, B2 ships.
+
+## Main model and TP/SL levels (`pipeline.py`, `models/`, `calibrate.py`, `exits.py`, `hitprob.py`, `explain.py`)
+
+`ltforecast train` runs every step on development rows only, on the same walk-forward folds:
+
+- Point forecast: LightGBM regression vs lambdarank at the base settings (optional 16-point grid), then
+  an ensemble of 5 LightGBM seeds + B3 + B2, weighted on inner validation and shrunk halfway to equal
+  weights. `rank_pct` is the per-date percentile.
+- `prob` = P(12m excess > 0) from an isotonic map fit on earlier folds whose labels had ended.
+- `sigma_hat`: a HAR-style ridge of log 12m realized vol. `q10/q50/q90`: LightGBM quantiles plus a
+  conformal offset from the last 36 matured months, so the 10-90% range targets 80% coverage.
+- TP/SL: the top quintile is simulated each month with 20 bps costs and gap fills; one global
+  (k_tp, k_sl) pair is chosen by mean net Sharpe across folds subject to drawdown no worse than holding.
+  If it does not beat holding, the levels are reported as risk reference levels. Trailing-stop and
+  signal exits are reported alongside. The barrier labels are rebuilt with sigma = `sigma_hat`.
+- `p_tp/p_sl/p_none`: a Monte Carlo table (bootstrapped residuals per volatility bucket, drift from
+  q50 + an assumed 6% market return) and a multiclass LightGBM, whichever has the lower OOF Brier score
+  (or their average).
+- `data/reports/train_report.md` checks all six pre-registered criteria, says whether the ensemble
+  beats B2 (paired Newey-West IC test) and what to ship, and gives the deflated Sharpe with the trial
+  count from `experiments/runs.csv`. A re-run of the same config on the same code logs 0 trials.
+  Results on synthetic data are stamped SYNTHETIC DATA.
+
+`ltforecast fit-final` refits everything on all development rows into `data/models/final/` (pickles with
+JSON sidecars, `metadata.json` with git commit, `trained_through`, config hash, trial count). In code,
+`pipeline.load_final` + `pipeline.score` produce the forecast columns for any prediction dates without
+reading labels; each row records `trained_through`.
 
 ## Point-in-time rules enforced in code
 

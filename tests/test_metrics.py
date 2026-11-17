@@ -677,10 +677,12 @@ def statuses(results: list[CheckResult]) -> dict[str, str]:
 def test_check_criteria_one_and_two():
     out = m.check_criteria(fake_report(0.05, 2.5, 15), CRITERIA)
     assert all(isinstance(r, CheckResult) for r in out)
-    assert [r.name for r in out] == ["rank_ic", "spread_positive_years", "beats_baseline", "interval_coverage", "calibration"]
+    assert [r.name for r in out] == [
+        "rank_ic", "spread_positive_years", "beats_baseline", "interval_coverage", "calibration", "tpsl_rules",
+    ]
     assert statuses(out) == {
         "rank_ic": "pass", "spread_positive_years": "pass",
-        "beats_baseline": "skip", "interval_coverage": "skip", "calibration": "skip",
+        "beats_baseline": "skip", "interval_coverage": "skip", "calibration": "skip", "tpsl_rules": "skip",
     }
     assert "0.0500" in out[0].detail and "2.50" in out[0].detail and "75%" in out[1].detail
 
@@ -718,8 +720,19 @@ def test_check_criteria_three_to_five():
     # supplying one input leaves the others skipped and criteria 1-2 untouched
     assert run(coverage=0.8) == {
         "rank_ic": "pass", "spread_positive_years": "pass",
-        "beats_baseline": "skip", "interval_coverage": "pass", "calibration": "skip",
+        "beats_baseline": "skip", "interval_coverage": "pass", "calibration": "skip", "tpsl_rules": "skip",
     }
+
+
+def test_check_criteria_six_needs_both_parts():
+    report = fake_report(0.05, 2.5, 15)
+
+    def run(beats, gap) -> str:
+        return statuses(m.check_criteria(report, CRITERIA, tpsl={"beats_hold": beats, "p_tp_gap": gap}))["tpsl_rules"]
+
+    # the rule must beat holding AND P(TP first) must be calibrated within 5 points (bound included)
+    assert [run(True, g) for g in (0.0, 0.05, 0.051, math.nan)] == ["pass", "pass", "fail", "fail"]
+    assert run(False, 0.0) == "fail"
 
 
 def test_check_criteria_end_to_end_on_an_evaluated_frame():
@@ -740,3 +753,20 @@ def test_check_criteria_end_to_end_on_an_evaluated_frame():
     modelconfig = pytest.importorskip("ltforecast.modelconfig")
     real = modelconfig.Criteria(**vars(CRITERIA))
     assert statuses(m.check_criteria(report, real)) == out
+
+
+def test_check_criteria_six_uses_the_worst_tested_hit_class():
+    report = fake_report(0.05, 2.5, 15)
+
+    def run(tpsl):
+        return m.check_criteria(report, CRITERIA, tpsl=tpsl)[-1]
+
+    # p_gap (any class) replaces p_tp_gap; the detail names the class that produced it
+    r = run({"beats_hold": True, "p_gap": 0.8, "p_gap_class": "sl", "p_tested": ["sl", "time"]})
+    assert r.status == "fail" and "P(SL hit first)" in r.detail and "P(neither hit)" in r.detail
+    assert run({"beats_hold": True, "p_gap": 0.04, "p_gap_class": "time"}).status == "pass"
+    assert run({"beats_hold": True, "p_gap": math.nan}).status == "fail"
+    # hold pair: no barriers, only the beats-hold part applies
+    hold = run({"beats_hold": True, "p_gap": math.nan, "p_applicable": False})
+    assert hold.status == "pass" and "not applicable" in hold.detail
+    assert run({"beats_hold": False, "p_gap": math.nan, "p_applicable": False}).status == "fail"

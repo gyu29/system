@@ -17,7 +17,7 @@ from conftest import business_days
 
 from ltforecast.modelconfig import ValidationRules
 from ltforecast.universe import month_end_dates
-from ltforecast.validation.runner import walk_forward
+from ltforecast.validation.runner import fit_on_all, walk_forward
 from ltforecast.validation.splitter import Fold, LeakageError, walk_forward_folds
 
 d = dt.date
@@ -297,3 +297,124 @@ def test_no_folds_gives_an_empty_frame():
     oof, fits, _ = run(folds=[])
     assert oof.is_empty() and fits == []
     assert oof.schema == {"date": pl.Date, "security_id": pl.Int64, "fold": pl.String, "pred": pl.Float64}
+
+
+# --- phase 5-6 extensions: several outputs, extra hidden columns, on_fold, fit_on_all ---
+
+
+class Multi(Spy):
+    """Three outputs per row: f1, -f1, f2."""
+
+    def predict(self, df):
+        self.log.append(("predict", df))
+        f1 = df["f1"].to_numpy()
+        return np.column_stack([f1, -f1, df["f2"].to_numpy()])
+
+
+def test_multi_output_gives_one_column_per_output():
+    folds = walk_forward_folds(D, RULES, d(2011, 12, 31))
+    oof = walk_forward(lambda: Multi([]), panel(), folds, RULES, outputs=("mu", "neg", "q"))
+    assert oof.schema == {"date": pl.Date, "security_id": pl.Int64, "fold": pl.String,
+                          "mu": pl.Float64, "neg": pl.Float64, "q": pl.Float64}
+    may = oof.filter(pl.col("date") == d(2010, 5, 28))
+    assert may["mu"].to_list() == pytest.approx([1.124, 2.124, 3.124, 4.124])
+    assert may["neg"].to_list() == pytest.approx([-1.124, -2.124, -3.124, -4.124])
+    assert may["q"].to_list() == [-1.0, -2.0, -3.0, -4.0]
+    # the key columns match the single-output run exactly
+    single, _, _ = run()
+    assert oof.select("date", "security_id", "fold").equals(single.select("date", "security_id", "fold"))
+    empty = walk_forward(lambda: Multi([]), panel(), [], RULES, outputs=("mu", "q"))
+    assert empty.is_empty() and empty.columns == ["date", "security_id", "fold", "mu", "q"]
+
+
+def test_multi_output_wrong_shape_raises():
+    folds = walk_forward_folds(D, RULES, d(2011, 12, 31))
+    with pytest.raises(ValueError, match="shape"):  # one column for two outputs
+        walk_forward(lambda: Fixed(lambda df: np.zeros(df.height)), panel(), folds, RULES, outputs=("a", "b"))
+    with pytest.raises(ValueError, match="shape"):  # three for two
+        walk_forward(lambda: Fixed(lambda df: np.zeros((df.height, 3))), panel(), folds, RULES, outputs=("a", "b"))
+    with pytest.raises(ValueError, match="shape"):  # transposed
+        walk_forward(lambda: Fixed(lambda df: np.zeros((2, df.height))), panel(), folds, RULES, outputs=("a", "b"))
+    with pytest.raises(ValueError, match="1 non-finite"):
+        def bad(df):
+            out = np.zeros((df.height, 2))
+            out[3, 1] = np.nan
+            return out
+        walk_forward(lambda: Fixed(bad), panel(), folds, RULES, outputs=("a", "b"))
+    with pytest.raises(ValueError, match="outputs"):
+        walk_forward(lambda: Spy([]), panel(), folds, RULES, outputs=("a", "a"))
+    with pytest.raises(ValueError, match="outputs"):
+        walk_forward(lambda: Spy([]), panel(), folds, RULES, outputs=("fold",))
+
+
+def test_extra_label_cols_are_stripped_at_predict():
+    # barrier outcomes are future data with names outside the standard label set
+    frame = panel().with_columns(pl.col("target").alias("hit_tp"), (pl.col("f1") * 0).alias("barrier_days"))
+    _, fits, predicts = run(frame, extra_label_cols=("hit_tp", "barrier_days"))
+    assert all(df.columns == FEATURE_COLS for df in predicts)
+    # fit still sees them (they are training targets)
+    assert {"hit_tp", "barrier_days"} <= set(fits[0][1].columns)
+    # without the argument they leak through, which is why callers must name them
+    _, _, leaky = run(frame)
+    assert "hit_tp" in leaky[0].columns
+    folds = walk_forward_folds(D, RULES, d(2011, 12, 31))
+    with pytest.raises((KeyError, pl.exceptions.ColumnNotFoundError)):
+        walk_forward(lambda: Leaky("hit_tp"), frame, folds, RULES, extra_label_cols=["hit_tp"])
+
+
+def test_on_fold_receives_each_fitted_model():
+    made, seen = [], []
+
+    def make():
+        made.append(Spy([]))
+        return made[-1]
+
+    folds = walk_forward_folds(D, RULES, d(2011, 12, 31))
+    oof = walk_forward(make, panel(), folds, RULES, on_fold=lambda f, m, t: seen.append((f, m, t)))
+    assert [f.name for f, _, _ in seen] == ["2010", "2011"]
+    assert [m for _, m, _ in seen] == made
+    # each model was already fit (and predicted) when handed over
+    assert all([k for k, *_ in m.log] == ["fit", "predict"] for _, m, _ in seen)
+    for fold, _, test in seen:
+        assert test.columns == FEATURE_COLS and test.height == 48
+        assert set(test["date"].to_list()) == set(fold.test_dates)
+    # the default run is unchanged by the callback
+    assert oof.equals(run()[0])
+
+
+def dev_through_2010() -> pl.DataFrame:
+    cut = d(2010, 12, 31)
+    frame = panel().filter(pl.col("date") <= cut)
+    late = pl.col("label_end_12m") > cut
+    cols = ["target", "rank_12m", "excess_12m", "label_end_12m"]
+    return frame.with_columns(pl.when(late).then(None).otherwise(pl.col(c)).alias(c) for c in cols)
+
+
+def test_fit_on_all_uses_inner_split_on_every_date():
+    # dev data ending 2010-12 (132 dates): 2010 labels end in 2011, after the data, so they are unknown
+    frame = dev_through_2010()
+    log: list = []
+    model = fit_on_all(lambda: Spy(log), frame, RULES)
+    assert isinstance(model, Spy) and len(log) == 1
+    _, train, valid = log[0]
+    # inner valid = last 24 dates 2009-01 .. 2010-12 minus the unlabelled 2010 -> 2009 only (12 dates)
+    assert valid["date"].min() == d(2009, 1, 30) and valid["date"].max() == d(2009, 12, 31)
+    assert valid.height == 12 * 4 and valid["target"].null_count() == 0
+    # inner train stops 13 dates before 2009-01: 132 - 24 - 13 = 95 dates, through 2007-11
+    assert train["date"].n_unique() == 95 and train["date"].max() == d(2007, 11, 30)
+    assert train["label_end_12m"].max() < valid["date"].min()
+    assert train.columns == frame.columns
+
+
+def test_fit_on_all_asserts_the_purge():
+    frame = dev_through_2010()
+    with pytest.raises(LeakageError):
+        fit_on_all(lambda: Spy([]), frame, ValidationRules(2010, 12, 0, 0, 60, 24))
+    # a label end that runs into inner validation is caught even with the right gap
+    hit = (pl.col("security_id") == 1) & (pl.col("date") == d(2003, 5, 30))
+    bad = frame.with_columns(pl.when(hit).then(pl.lit(d(2010, 1, 29))).otherwise(pl.col("label_end_12m"))
+                             .alias("label_end_12m"))
+    with pytest.raises(LeakageError, match="1 training rows"):
+        fit_on_all(lambda: Spy([]), bad, RULES)
+    with pytest.raises(ValueError, match="nothing to fit"):
+        fit_on_all(lambda: Spy([]), frame.filter(pl.col("date") <= d(2002, 12, 31)), RULES)

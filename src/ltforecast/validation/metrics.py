@@ -465,17 +465,25 @@ def check_criteria(
     vs_baseline: dict[str, Any] | None = None,
     coverage: float | None = None,
     calibration_gap: float | None = None,
+    tpsl: dict[str, Any] | None = None,
 ) -> list[CheckResult]:
-    """The pre-registered success criteria 1-5 of plan section 0 as pass | fail | skip rows.
+    """The pre-registered success criteria 1-6 of plan section 0 as pass | fail | skip rows.
 
     report           from `evaluate` (criteria 1 and 2);
     vs_baseline      `paired_ic_test(model, baseline)` for criterion 3: the IC gain must be positive with
                      a Newey-West t-stat >= criteria.min_ic_tstat;
     coverage         `interval_coverage` of the 10-90% range, for criterion 4;
-    calibration_gap  `max_calibration_gap` of P(beat market), for criterion 5.
+    calibration_gap  `max_calibration_gap` of P(beat market), for criterion 5;
+    tpsl             criterion 6: {"beats_hold": the chosen TP/SL pair beats plain holding on mean net
+                     Sharpe and is no worse on max drawdown (exits verdict "exit_orders"),
+                     "p_gap": the largest `max_calibration_gap` over the hit classes the pair has
+                     (hitprob.hit_calibration; "p_tp_gap" is read when "p_gap" is absent),
+                     optional "p_gap_class" (tp | sl | time, the class giving p_gap), "p_tested"
+                     (classes checked) and "p_applicable" (False for the hold pair: no barriers, so
+                     only the beats-hold part applies)}, plus optional "detail" text; both parts must hold.
     A criterion whose input is not supplied is "skip"; a NaN statistic fails.
     `criteria` needs min_rank_ic, min_ic_tstat, min_positive_spread_years, coverage_range,
-    calibration_tolerance (modelconfig.Criteria)."""
+    calibration_tolerance, tpsl_prob_tolerance (modelconfig.Criteria)."""
     ic = report["ic"]
     ic_ok = ic["mean_ic"] >= criteria.min_rank_ic - _EPS and ic["nw_tstat"] >= criteria.min_ic_tstat - _EPS
     years = report["spread_by_year"].height
@@ -522,7 +530,32 @@ def check_criteria(
             f"largest gap between forecast and realized P(beat market) {calibration_gap:.1%} "
             f"(need <= {criteria.calibration_tolerance:.0%})",
         ))
+    if tpsl is None:
+        out.append(CheckResult("tpsl_rules", "skip", "no TP/SL evaluation supplied"))
+    else:
+        beats = bool(tpsl["beats_hold"])
+        tol = criteria.tpsl_prob_tolerance
+        extra = f"; {tpsl['detail']}" if tpsl.get("detail") else ""
+        head = f"TP/SL rule {'beats' if beats else 'does not beat'} plain holding on net Sharpe and max drawdown; "
+        if tpsl.get("p_applicable") is False:
+            out.append(_check("tpsl_rules", beats,
+                              head + f"hit-probability calibration not applicable (no barriers){extra}"))
+        else:
+            gap = tpsl["p_gap"] if "p_gap" in tpsl else tpsl.get("p_tp_gap", math.nan)
+            gap = math.nan if gap is None else float(gap)
+            label = _HIT_LABELS.get(tpsl.get("p_gap_class") or "tp", "P(TP hit first)")
+            tested = tpsl.get("p_tested")
+            listed = f" over {', '.join(_HIT_LABELS.get(c, c) for c in tested)}" if tested else ""
+            out.append(_check(
+                "tpsl_rules",
+                beats and gap <= tol + _EPS,
+                head + f"largest hit-probability calibration gap {gap:.1%} ({label}){listed} "
+                f"(need <= {tol:.0%}){extra}",
+            ))
     return out
+
+
+_HIT_LABELS = {"tp": "P(TP hit first)", "sl": "P(SL hit first)", "time": "P(neither hit)"}
 
 
 def _check(name: str, ok: bool, detail: str) -> CheckResult:

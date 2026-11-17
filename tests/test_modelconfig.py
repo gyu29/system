@@ -125,3 +125,47 @@ def test_empty_file_raises(tmp_path):
     path.write_text("# nothing here\n")
     with pytest.raises(ValueError, match="not a mapping"):
         load_model_config(path)
+
+
+def test_model_sections_have_plan_defaults():
+    mc = load_model_config()
+    assert mc.lgbm.params.min_data_in_leaf == 1000 and mc.lgbm.seeds == (0, 1, 2, 3, 4) and mc.lgbm.tune is False
+    assert mc.baselines.ridge_alphas == (1.0, 10.0, 100.0, 1000.0, 10000.0)
+    assert mc.quantile.alphas == (0.1, 0.5, 0.9)
+    assert mc.levels.market_return == 0.06 and mc.levels.k_trail == (1.0, 1.5, 2.0)
+    assert mc.calibration.alpha == 0.2 and mc.ensemble.shrinkage == 0.5
+    assert mc.fast is False
+
+
+def test_fast_overrides_only_model_sections(tmp_path, raw):
+    fast = load_model_config(write(tmp_path, raw), fast=True)
+    assert fast.fast and fast.lgbm.seeds == (0, 1) and fast.levels.mc_paths == 2000
+    assert fast.validation == load_model_config().validation and fast.criteria == load_model_config().criteria
+    raw["fast"]["criteria"] = {"min_rank_ic": 0.0}
+    with pytest.raises(ValueError, match="criteria"):
+        load_model_config(write(tmp_path, raw))  # validated even without --fast
+
+
+def test_model_sections_are_optional_but_reject_typos(tmp_path, raw):
+    for sec in ("baselines", "lgbm", "ensemble", "vol", "quantile", "calibration", "levels", "hit_classifier", "fast"):
+        del raw[sec]
+    mc = load_model_config(write(tmp_path, raw))
+    assert mc.lgbm.params.num_leaves == 15 and mc.levels.mc_paths == 10_000
+    raw["lgbm"] = {"num_leafs": 31}
+    with pytest.raises(ValueError, match="num_leafs"):
+        load_model_config(write(tmp_path, raw))
+    raw["lgbm"] = {"num_leaves": 31.5}
+    with pytest.raises(ValueError, match="num_leaves"):
+        load_model_config(write(tmp_path, raw))
+
+
+def test_calibration_min_dates_and_vol_refit(tmp_path, raw):
+    mc = load_model_config()
+    assert mc.calibration.min_dates == 12 and mc.vol.refit is True
+    raw["calibration"]["min_dates"] = 0
+    with pytest.raises(ValueError, match="min_dates"):
+        load_model_config(write(tmp_path, raw))
+    # the conformal window must be able to hold min_dates dates
+    raw["calibration"]["min_dates"] = raw["calibration"]["window_months"] + 1
+    with pytest.raises(ValueError, match="min_dates"):
+        load_model_config(write(tmp_path, raw))

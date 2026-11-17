@@ -21,6 +21,16 @@ class Model(Protocol):
     def predict(self, df: pl.DataFrame) -> np.ndarray: ...  # one score per row, higher = better
 
 
+def _check_pred(pred: np.ndarray, n: int, outputs: Sequence[str], where: str) -> np.ndarray:
+    """(n, len(outputs)) float64 array. One output must come back as shape (n,), several as (n, k)."""
+    want = (n,) if len(outputs) == 1 else (n, len(outputs))
+    if pred.shape != want:
+        raise ValueError(f"{where}: predict returned shape {pred.shape} for {n} rows, expected {want}")
+    if not np.isfinite(pred).all():
+        raise ValueError(f"{where}: predict returned {int((~np.isfinite(pred)).sum())} non-finite values")
+    return pred.reshape(n, len(outputs))
+
+
 def walk_forward(
     make_model: Callable[[], Model],
     frame: pl.DataFrame,
@@ -29,16 +39,26 @@ def walk_forward(
     *,
     target: str = "target",
     label_end_col: str = "label_end_12m",
+    outputs: Sequence[str] = ("pred",),
+    extra_label_cols: Sequence[str] = (),
+    on_fold: Callable[[Fold, Model, pl.DataFrame], None] | None = None,
 ) -> pl.DataFrame:
-    """Out-of-fold predictions. Columns: date, security_id, fold, pred; sorted by date, security_id.
+    """Out-of-fold predictions. Columns: date, security_id, fold, *outputs (default one column `pred`);
+    sorted by date, security_id.
 
     Per fold a fresh model is fit on (inner_train, inner_valid) from `inner_split`, both without
     null-target rows; the purged months between the two are not passed to the model. `assert_purged`
     is checked for train vs the first test date and for inner_train vs the first inner_valid date.
-    Every test row is scored, labelled or not, from a frame with all label columns (and `target`)
-    removed, so a model cannot read a test label.
+    Every test row is scored, labelled or not, from a frame with all label columns, `target` and
+    `extra_label_cols` removed, so a model cannot read a test label. With one output `predict` returns
+    shape (n,); with k outputs shape (n, k), column j going to `outputs[j]`.
+    `on_fold(fold, model, test_frame)` is called after each fold with the fitted model and the
+    label-free frame it scored.
     """
-    hidden = sorted(set(label_columns(frame.columns)) | {target})
+    outputs = tuple(outputs)
+    if not outputs or len(set(outputs)) != len(outputs) or set(outputs) & {"date", "security_id", "fold"}:
+        raise ValueError(f"outputs must be distinct non-key column names, got {outputs}")
+    hidden = sorted((set(label_columns(frame.columns)) | {target} | set(extra_label_cols)) & set(frame.columns))
     labelled = pl.col(target).is_not_null()
     # narrow copy for the outer purge check, so the full training frame is not materialized twice
     ends = frame.filter(labelled).select("date", target, label_end_col)
@@ -60,18 +80,47 @@ def walk_forward(
             raise ValueError(f"fold {fold.name}: no rows on its test dates")
         model = make_model()
         model.fit(train, valid)
-        pred = np.asarray(model.predict(test.drop(hidden)), dtype=np.float64)
-        if pred.shape != (test.height,):
-            raise ValueError(f"fold {fold.name}: predict returned shape {pred.shape} for {test.height} rows")
-        if not np.isfinite(pred).all():
-            raise ValueError(f"fold {fold.name}: predict returned {int((~np.isfinite(pred)).sum())} non-finite values")
+        shown = test.drop(hidden)
+        pred = _check_pred(
+            np.asarray(model.predict(shown), dtype=np.float64), test.height, outputs, f"fold {fold.name}"
+        )
         out.append(
             test.select("date", "security_id").with_columns(
-                pl.lit(fold.name).alias("fold"), pl.Series("pred", pred, dtype=pl.Float64)
+                pl.lit(fold.name).alias("fold"),
+                *(pl.Series(name, pred[:, j], dtype=pl.Float64) for j, name in enumerate(outputs)),
             )
         )
+        if on_fold is not None:
+            on_fold(fold, model, shown)
     if not out:
         return pl.DataFrame(
-            schema={"date": pl.Date, "security_id": pl.Int64, "fold": pl.String, "pred": pl.Float64}
+            schema={"date": pl.Date, "security_id": pl.Int64, "fold": pl.String} | {o: pl.Float64 for o in outputs}
         )
     return pl.concat(out).sort("date", "security_id")
+
+
+def fit_on_all(
+    make_model: Callable[[], Model],
+    frame: pl.DataFrame,
+    rules: ValidationRules,
+    *,
+    target: str = "target",
+    label_end_col: str = "label_end_12m",
+) -> Model:
+    """One model fit on every date of `frame` (fit-final, holdout retrain).
+
+    The distinct dates of `frame` are split by `inner_split` into (inner_train, inner_valid); both
+    keep only labelled rows, and `assert_purged` checks that every inner-train label ended before
+    inner validation starts. The caller decides which rows `frame` holds (dev rows only before Phase 9).
+    """
+    dates = frame["date"].unique().sort().to_list()
+    train_dates, valid_dates = inner_split(dates, rules)
+    labelled = pl.col(target).is_not_null()
+    train = frame.filter(pl.col("date").is_in(list(train_dates)) & labelled)
+    valid = frame.filter(pl.col("date").is_in(list(valid_dates)) & labelled)
+    if train.is_empty() or valid.is_empty():
+        raise ValueError("fit_on_all: no labelled rows to train or validate on")
+    assert_purged(train, valid_dates[0], label_end_col, target=target)
+    model = make_model()
+    model.fit(train, valid)
+    return model

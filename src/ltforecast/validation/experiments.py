@@ -216,6 +216,25 @@ def log_run(dir: str | Path, name: str, config: dict, metrics: dict, n_trials: i
     return row
 
 
+def log_new(dir: str | Path, name: str, config: dict, metrics: dict, n_trials: int = 1) -> dict:
+    """`log_run`, except that a re-run of an already-counted configuration logs n_trials = 0.
+
+    "Already counted" = a row with the same name, config_hash and code_hash exists: the same config on
+    the same code is no new chance to select on noise (rerunning `train`, or `baselines` then `train`).
+    Changed code (code_hash) counts again, since the result can differ. The run is always appended."""
+    path = Path(dir) / RUNS_FILE
+    runs = read_runs(dir)
+    if runs.height:
+        seen = runs.filter(
+            (pl.col("name") == str(name))
+            & (pl.col("config_hash") == config_hash(config))
+            & (pl.col("code_hash") == code_hash(path))
+        )
+        if seen.height:
+            n_trials = 0
+    return log_run(dir, name, config, metrics, n_trials=n_trials)
+
+
 def read_runs(dir: str | Path) -> pl.DataFrame:
     """The run log in file order; an empty frame with the same schema if there is no log yet.
 

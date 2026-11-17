@@ -1,4 +1,4 @@
-"""ltforecast command line: ingest -> build -> check -> labels -> features."""
+"""ltforecast command line: ingest -> build -> check -> labels -> features -> baselines -> train -> fit-final."""
 
 from __future__ import annotations
 
@@ -21,6 +21,10 @@ ingest_app = typer.Typer(no_args_is_help=True, help="Download vendor data into d
 app.add_typer(ingest_app, name="ingest")
 
 ConfigOpt = typer.Option(DEFAULT_CONFIG, "--config", help="Path to universe.yaml")
+ModelConfigOpt = typer.Option(
+    None, "--model-config", help="Path to model.yaml (default: model.yaml next to --config, else config/model.yaml)"
+)
+FastOpt = typer.Option(False, "--fast", help="Small run: fewer seeds, no tuning grid, fewer Monte Carlo paths")
 ReplaceSyntheticOpt = typer.Option(
     False, "--replace-synthetic", help="Delete the synthetic raw data in data/raw before writing vendor data"
 )
@@ -229,6 +233,70 @@ def check(config: Path = ConfigOpt) -> None:
     typer.echo(f"coverage and spot-check reports in {store.root / 'reports'}")
     if any(r.status == "fail" for r in results):
         raise typer.Exit(1)
+
+
+def _model_config(config: Path, model_config: Path | None, fast: bool):
+    """model.yaml: --model-config, else the one next to universe.yaml, else the repo default."""
+    from ltforecast.modelconfig import DEFAULT_MODEL_CONFIG, load_model_config
+
+    if model_config is None:
+        beside = Path(config).parent / "model.yaml"
+        model_config = beside if beside.exists() else DEFAULT_MODEL_CONFIG
+    return load_model_config(model_config, fast=fast)
+
+
+def _synthetic_warning(store: Store) -> None:
+    from ltforecast.pipeline import provenance
+
+    if provenance(store).get("synthetic"):
+        typer.echo("WARNING: SYNTHETIC DATA. Results say nothing about real markets.")
+
+
+@app.command()
+def baselines(fast: bool = FastOpt, config: Path = ConfigOpt, model_config: Path | None = ModelConfigOpt) -> None:
+    """Walk the plan-5 baselines (B0-B3) forward; writes data/models/oof/<name>.parquet and
+    data/reports/baselines.csv."""
+    from ltforecast.features.catalog import load_catalog
+    from ltforecast.pipeline import reports_dir, run_baselines
+
+    cfg = load_config(config)
+    store = Store(cfg.data_dir)
+    table, _ = run_baselines(store, cfg, _model_config(config, model_config, fast), load_catalog())
+    _synthetic_warning(store)
+    for row in table.iter_rows(named=True):
+        typer.echo(f"{row['model']:<26} mean IC {row['mean_ic']:+.4f}  NW t {row['nw_tstat']:+.2f}")
+    typer.echo(f"baselines -> {reports_dir(store) / 'baselines.csv'}")
+
+
+@app.command()
+def train(fast: bool = FastOpt, config: Path = ConfigOpt, model_config: Path | None = ModelConfigOpt) -> None:
+    """Walk-forward training of the plan-6 models on development rows; writes
+    data/models/oof/forecast.parquet and data/reports/train_report.{json,md}."""
+    from ltforecast.features.catalog import load_catalog
+    from ltforecast.pipeline import train as run_train
+
+    cfg = load_config(config)
+    store = Store(cfg.data_dir)
+    result = run_train(store, cfg, _model_config(config, model_config, fast), load_catalog())
+    _synthetic_warning(store)
+    for c in result.report["criteria"]:
+        typer.echo(f"[{c['status'].upper():4}] {c['n']}. {c['name']}: {c['detail']}")
+    typer.echo(f"ensemble beats B2: {'yes' if result.report['beats_b2'] else 'no'}; "
+               f"recommendation: {result.recommendation}; trials logged: {result.report['trial_count']}")
+    typer.echo(f"forecast -> {result.paths['forecast']}; report -> {result.paths['report_md']}")
+
+
+@app.command("fit-final")
+def fit_final(fast: bool = FastOpt, config: Path = ConfigOpt, model_config: Path | None = ModelConfigOpt) -> None:
+    """Refit every model on all development rows (after `train`); writes data/models/final/."""
+    from ltforecast.features.catalog import load_catalog
+    from ltforecast.pipeline import fit_final as run_fit_final
+
+    cfg = load_config(config)
+    store = Store(cfg.data_dir)
+    out = run_fit_final(store, cfg, _model_config(config, model_config, fast), load_catalog())
+    _synthetic_warning(store)
+    typer.echo(f"final models (trained through {cfg.dates.dev_end}) -> {out}")
 
 
 if __name__ == "__main__":

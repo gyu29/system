@@ -401,3 +401,13 @@ def test_selection_guard_refuses_too_few_or_broken_folds():
         ex.selection_guard({"2010": 0.02, "2011": 0.04, "2012": None})
     with pytest.raises(ValueError, match="2010"):
         ex.selection_guard({"2010": float("inf"), "2011": 0.04, "2012": 0.06})
+
+
+def test_log_new_counts_a_rerun_of_the_same_config_once(log_dir):
+    ex.log_new(log_dir, "baseline/b2", {"a": 1}, {"ic": 0.01}, n_trials=1)
+    ex.log_new(log_dir, "baseline/b2", {"a": 1}, {"ic": 0.01}, n_trials=1)   # same name, config, code
+    ex.log_new(log_dir, "baseline/b2", {"a": 2}, {"ic": 0.02}, n_trials=1)   # new config: a new trial
+    ex.log_new(log_dir, "baseline/b3", {"a": 1}, {"ic": 0.03}, n_trials=1)   # other name: a new trial
+    runs = ex.read_runs(log_dir)
+    assert runs.height == 4 and runs["n_trials"].to_list() == [1, 0, 1, 1]
+    assert ex.trial_count(log_dir) == 3

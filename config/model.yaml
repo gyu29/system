@@ -31,3 +31,105 @@ criteria:                    # plan section 0, pre-registered — never tune the
 costs_bps: 20                # one-way trading cost in every simulation (plan 6.5 and 7)
 
 experiments_dir: experiments # run log + trial counter (plan 4.3); relative to the repo root
+
+# ---------------------------------------------------------------------------------------------------
+# Phases 5-6 model settings. Fixed before the first walk-forward run; every configuration that gets
+# scored on the folds is logged with its trial count (plan 4.3). A missing key takes the module default.
+
+baselines:                   # plan 5
+  single_factors: [mom_12_1, gross_profitability, earnings_yield]   # B1: one model per factor
+  ridge_alphas: [1, 10, 100, 1000, 10000]   # B3: alpha picked by inner-validation mean IC
+  ic_min_n: 10               # names a date needs for its IC to count
+
+lgbm:                        # plan 6.1, conservative settings for low signal-to-noise data
+  objective: regression      # regression on the rank label; lambdarank is compared at this point first
+  num_leaves: 15             # plan: 15-31
+  max_depth: 5               # plan: 4-6
+  min_data_in_leaf: 1000     # plan: 500-2000
+  learning_rate: 0.02        # plan: 0.01-0.03
+  feature_fraction: 0.6      # plan: 0.5-0.7
+  bagging_fraction: 0.7
+  bagging_freq: 1
+  lambda_l2: 10.0            # plan: > 0
+  n_estimators: 2000         # cap; early stopping on the purged inner-validation IC decides
+  n_estimators_no_valid: 300
+  early_stopping_rounds: 100
+  refit: true                # refit on inner train + valid for the early-stopped number of rounds
+  num_threads: 0             # 0 = all cores
+  lambdarank_truncation_level: 100
+  seeds: [0, 1, 2, 3, 4]     # plan 6.1: average of 5 LightGBM seeds
+  tune: false                # true: 16-point grid after the objective comparison (<= 18 LightGBM trials)
+
+ensemble:                    # plan 6.1: 5 LightGBM seeds + ridge (B3) + composite (B2)
+  step: 0.1                  # weight grid on the simplex, chosen on inner validation
+  shrinkage: 0.5             # final weights = 0.5 * best grid weights + 0.5 * equal weights
+  ic_min_n: 10
+  importance_max_rows: 20000 # rows per fold for global TreeSHAP importance (plan 6.4)
+
+vol:                         # plan 6.3: HAR-style ridge of log 12m realized vol
+  alpha: 0.001
+  clip_low: 0.05             # annualized sigma_hat bounds
+  clip_high: 3.0
+  use_sector: true
+  refit: true                # score valid R² on the train-only fit, then re-estimate on train + valid
+
+quantile:                    # plan 6.3: LightGBM quantile objective, then conformal correction
+  alphas: [0.1, 0.5, 0.9]
+  num_leaves: 15
+  max_depth: 5
+  min_data_in_leaf: 1000
+  learning_rate: 0.02
+  feature_fraction: 0.6
+  bagging_fraction: 0.7
+  bagging_freq: 1
+  lambda_l2: 10.0
+  n_estimators: 2000
+  n_estimators_no_valid: 300
+  early_stopping_rounds: 100
+  refit: true
+  num_threads: 0
+  seed: 0
+
+calibration:                 # plan 6.2 (isotonic P(beat market)) and 6.3 (conformal range)
+  min_rows: 2000             # usable earlier-fold OOF rows needed for an isotonic map or conformal offset
+  min_dates: 12              # distinct matured dates needed for an isotonic map / conformal offset (one month = one market state), else prob = 0.5 / offset 0
+  alpha: 0.2                 # 10-90% range: target coverage 80% (criterion 4)
+  window_months: 36          # the conformal offset uses the most recent 36 months of matured OOF rows
+  outcome: excess_12m        # raw 12m log excess return
+  min_bin_rows: 100          # a calibration bin needs this many forecasts to count in criteria 5 and 6
+
+levels:                      # plan 6.5: TP/SL levels, exit variants and hit probabilities
+  market_return: 0.06        # assumed annual market return for the Monte Carlo drift (fixed, not forecast)
+  top_fraction: 0.20         # exit simulation buys the top quintile each month
+  k_trail: [1.0, 1.5, 2.0]   # trailing-stop variants: k_trail * sigma below the highest close
+  signal_threshold: 0.40     # signal-exit variant: sell when the rank drops below the 40th percentile
+  mc_paths: 10000            # simulated paths per volatility bucket
+  n_buckets: 3               # volatility terciles for the bootstrapped residuals
+  seed: 0
+  max_residuals_per_bucket: 2000000
+  # hit-table grid: drift over the horizon in horizon sigmas, barrier distance in horizon sigmas
+  # (null = the hitprob defaults: theta -5..5 step 0.25; 28 barrier nodes 0.02..8 plus no barrier)
+  theta_nodes: null
+  barrier_nodes: null
+
+hit_classifier:              # plan 6.5 method 2: LightGBM multiclass (tp | sl | time) on barrier labels
+  num_leaves: 15
+  max_depth: 5
+  min_data_in_leaf: 1000
+  learning_rate: 0.02
+  feature_fraction: 0.6
+  bagging_fraction: 0.7
+  bagging_freq: 1
+  lambda_l2: 10.0
+  n_estimators: 2000
+  n_estimators_no_valid: 300
+  early_stopping_rounds: 100
+  refit: true
+  num_threads: 0
+  seed: 0
+
+fast:                        # `--fast`: small runs and tests. Never changes folds, purge or criteria.
+  lgbm: {seeds: [0, 1], tune: false, n_estimators: 500, early_stopping_rounds: 50}
+  quantile: {n_estimators: 500, early_stopping_rounds: 50}
+  hit_classifier: {n_estimators: 500, early_stopping_rounds: 50}
+  levels: {mc_paths: 2000}
